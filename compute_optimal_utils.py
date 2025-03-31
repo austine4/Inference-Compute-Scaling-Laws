@@ -96,7 +96,7 @@ class ModelFramework:
         """
         return np.log2(l) if l > 1 else 0
     
-    # Change phi to be multimodal over m
+    # Task distribution function over l,m
     def phi(self, l,m):
 
         # Let phi_l be a mixture of binomial distribution
@@ -884,6 +884,7 @@ class ModelFramework:
         
         return expected_accuracy, expected_cost
     
+    # Minimize C_tot
     def find_optimal_allocation(self, total_budget, n_steps=10):
         """
         Find the optimal allocation of resources between training and inference.
@@ -2031,7 +2032,7 @@ def run_example():
         'L_max': 100,
         'm_min': 2,  # Minimum difficulty level
         'm_max': 50,  # Maximum difficulty level
-        'S_l': 1e3,
+        'S_l': 1e4,
         'd_t': 6,
         'zeta': 2.5e3,
         'tau': 1e4,
@@ -2042,8 +2043,8 @@ def run_example():
     }
     
     # Define base ranges for grid evaluation
-    base_C_tr_values = np.logspace(18, 25, 10)  
-    base_C_inf_values = np.logspace(9, 20, 10)  
+    base_C_tr_values = np.logspace(18, 26, 20)  
+    base_C_inf_values = np.logspace(9, 20, 20)  
     
     # Initialize results dataframe
     all_results_df = pd.DataFrame()
@@ -2073,7 +2074,7 @@ def run_example():
         plot_model_results(cot_model, cot_df, "cot")
     except Exception as e:
         print(f"Error plotting for COT model: {e}")
-    """
+    
     # 2. TEST MCTS MODEL WITH 3X BUDGET
     print("Evaluating MCTS model with 3x inference budget...")
     branching_factor = 3
@@ -2086,7 +2087,7 @@ def run_example():
     mcts_C_inf_values = base_C_inf_values * branching_factor
     
     # Evaluate with scaled budget
-    mcts_df = mcts_model.evaluate_grid(
+    mcts_df = mcts_model.evaluate_grid_parallel(
         base_C_tr_values, mcts_C_inf_values, 
         output_file="accuracy_results_mcts.csv",
         replace=True
@@ -2110,7 +2111,7 @@ def run_example():
     bon_C_inf_values = base_C_inf_values * n_samples
     
     # Evaluate with scaled budget
-    bon_df = bon_model.evaluate_grid(
+    bon_df = bon_model.evaluate_grid_parallel(
         base_C_tr_values, bon_C_inf_values, 
         output_file="accuracy_results_best_of_n.csv",
         replace=True
@@ -2135,7 +2136,7 @@ def run_example():
         consensus_C_inf_values = base_C_inf_values * consensus_count
         
         # Evaluate with scaled budget
-        consensus_df = consensus_model.evaluate_grid(
+        consensus_df = consensus_model.evaluate_grid_parallel(
             base_C_tr_values, consensus_C_inf_values, 
             output_file="accuracy_results_consensus.csv",
             replace=True
@@ -2152,7 +2153,7 @@ def run_example():
     
     # Save combined results
     all_results_df.to_csv("all_models_results.csv", index=False)
-    """
+    
     # Create comparison plots
     try:
         plot_model_comparisons(all_results_df)
