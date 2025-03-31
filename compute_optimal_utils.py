@@ -1,0 +1,2507 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+import matplotlib.cm as cm
+from scipy.special import lambertw, comb, betainc
+from scipy.optimize import minimize_scalar
+import pandas as pd
+from scipy.interpolate import griddata, LinearNDInterpolator
+import warnings
+import os
+from enum import Enum
+warnings.filterwarnings('ignore')
+
+class InferencePolicy(Enum):
+    """Enumeration of different inference policies."""
+    COT = "cot"
+    BEST_OF_N = "best_of_n"
+    MARKOV_TREE_SEARCH = "markov_tree_search"
+    CONSENSUS = "consensus"
+
+class ModelFramework:
+    """
+    A framework for evaluating models with configurable parameters and policies.
+    """
+    
+    # Default constants
+    DEFAULT_CONSTANTS = {
+        'L_min': 1,  # Minimum skill level
+        'L_max': 100, # Maximum skill level
+        'm_min': 2, # Minimum number of skills
+        'm_max': 50, # Maximum number of skills
+        'S_l': 1e3, # Number of skills per level
+        'd_t': 6, # Degrees of text pieces (number of skills required to understand a text) is binomially distributed with a fixed mean degree, d_t
+        'zeta': 2.5e3, # Parameters per concept
+        'tau': 1e4, # Tokens per training text piece
+        'omega': 25, # Output tokens per inference step
+        'kappa': 20, # D_tr / N for chinchilla optimal
+        'beta': 2, # Factor to scale skills required to relevant set
+        'rho': .5 # Search efficiency between relevant and required sets
+    }
+    
+    def __init__(self, 
+                 constants=None, 
+                 policy_type=InferencePolicy.COT,
+                 policy_params=None):
+        """
+        Initialize the model with configurable constants and policy.
+        
+        Args:
+            constants (dict, optional): Dictionary of constants to override defaults.
+            policy_type (InferencePolicy, optional): Type of inference policy to use.
+            policy_params (dict, optional): Parameters for the inference policy.
+        """
+        # Set up constants
+        self.constants = self.DEFAULT_CONSTANTS.copy()
+        if constants:
+            self.constants.update(constants)
+        
+        # Extract constants for easier access
+        for key, value in self.constants.items():
+            setattr(self, key, value)
+            
+        # Set policy type and parameters
+        self.policy_type = policy_type
+        self.policy_params = policy_params or {}
+        
+        # Cache for recursive values
+        self._p_values = None
+        self._gamma_values = None
+    
+    # =========================================================================
+    # MODEL-SPECIFIC FUNCTIONS (CAN BE OVERRIDDEN)
+    # =========================================================================
+    
+    def eta_l(self, l):
+        """
+        Compute eta_l based on skill level l.
+        
+        Args:
+            l (int): Skill level
+            
+        Returns:
+            float: eta_l value
+        """
+        return np.exp(7 * l / self.L_max)
+    
+    def sigma_l(self, l):
+        """
+        Compute sigma_l based on skill level l.
+        
+        Args:
+            l (int): Skill level
+            
+        Returns:
+            float: sigma_l value
+        """
+        return np.log2(l) if l > 1 else 0
+    
+    # Change phi to be multimodal over m
+    def phi(self, l,m):
+
+        # Let phi_l be a mixture of binomial distribution
+        if l < self.L_min or l > self.L_max:
+            return 0
+        phi_l = 1/(self.L_max-self.L_min+1)
+        """
+        # Parameters for the three components:
+        mu1, mu2, mu3 = 30, 60, 90      # centers for the peaks
+        sigma1, sigma2, sigma3 = 1.0, 1.0, 1.0  # adjust these to control the width of each peak
+        # Mixture weights (you can adjust these so that the peaks are similar in height)
+        w1, w2, w3 = 0.33, 0.33, 0.34  # must sum to 1
+        l_values = np.arange(1, L+1)
+        # Define the unnormalized PMF using Gaussian-like bumps
+        phi_l_unnormalized = (w1 * np.exp(-0.5 * ((l_values - mu1)/sigma1)**2) +
+                        w2 * np.exp(-0.5 * ((l_values - mu2)/sigma2)**2) +
+                        w3 * np.exp(-0.5 * ((l_values - mu3)/sigma3)**2))
+        phi_l = (phi_l_unnormalized / phi_l_unnormalized.sum())[l-1]
+        """
+
+        # Let phi_m be a mixture of binomial distribution
+        if m < self.m_min or m > self.m_max:
+            return 0
+        phi_m = 1/(self.m_max-self.m_min+1)
+        """
+        # Parameters for the three components:
+        mu1, mu2 = 30, 70      # centers for the peaks
+        sigma1, sigma2 = 1.0, 1.0  # adjust these to control the width of each peak
+        # Mixture weights (you can adjust these so that the peaks are similar in height)
+        w1, w2 = 0.5, 0.5  # must sum to 1
+        m_values = np.arange(2, m_max+1)
+        # Define the unnormalized PMF using Gaussian-like bumps
+        phi_m_unnormalized = (w1 * np.exp(-0.5 * ((m_values - mu1)/sigma1)**2) +
+                        w2 * np.exp(-0.5 * ((m_values - mu2)/sigma2)**2))
+        phi_m = (phi_m_unnormalized / phi_m_unnormalized.sum())[m-2]
+        """
+        return phi_l * phi_m
+    
+    def q(self, p):
+        """
+        Compute probability of successfully completing a task based on connection probability.
+        
+        Args:
+            p (float): Connection probability
+            
+        Returns:
+            float: Success probability
+        """
+        return p
+    
+    # =========================================================================
+    # CORE MATHEMATICAL FUNCTIONS
+    # =========================================================================
+    
+    def D_KL(self, p, q):
+        """
+        Compute KL divergence between two Bernoulli distributions with probabilities p and q.
+        Handles very small values with high precision.
+    
+        Args:
+            p (float): Probability of success for first Bernoulli distribution
+            q (float): Probability of success for second Bernoulli distribution
+    
+        Returns:
+            float: KL divergence value (in nats)
+        """
+        # Convert to high precision float
+        p = np.float128(p)
+        q = np.float128(q)
+    
+        # Validate inputs
+        if not (0 <= p <= 1 and 0 <= q <= 1):
+            raise ValueError("Probabilities must be between 0 and 1")
+    
+        
+        # Compute KL divergence for Bernoulli
+        # KL = p * log(p/q) + (1-p) * log((1-p)/(1-q))
+        term1 = p * (np.log(p) - np.log(q))
+        term2 = (1 - p) * (np.log(1 - p) - np.log(1 - q))
+    
+        kl = term1 + term2
+    
+        # Check for invalid values
+        if np.isnan(kl) or np.isinf(kl):
+            return np.inf
+    
+        return float(kl)
+ 
+    
+    def g_function(self, R, p_rr, eta):
+        """
+        Compute g(R, p_rr, eta_l).
+        
+        Args:
+            R (float): R parameter
+            p_rr (float): p_rr value
+            eta (float): eta value
+            
+        Returns:
+            float: g function value
+        """
+        R_choose_2 = comb(R, 2)
+        # Ensure eta/R_choose_2 is within [0,1]
+        eta_ratio = eta/R_choose_2#min(max(eta/R_choose_2, 0), 1)
+        # Ensure p_rr is within (0,1)
+        p_rr_safe = p_rr#min(max(p_rr, 1e-10), 1-1e-10)
+        
+        return np.exp(-R_choose_2 * self.D_KL(eta_ratio, p_rr_safe))
+    
+    def compute_p_rr(self, R, T, d_t):
+        # Use logs for stability in computing the (1 - (d_t/R)**2)**T part of (1 - (1 - (d_t/R)**2)**T) / (S_l**2)
+        # Compute x = (d_t / R)^2
+        x = (d_t / R)**2
+        # Calculate the exponent in a numerically stable manner
+        exponent = T * np.log1p(-x)
+        # Use np.expm1 to compute 1 - exp(exponent) accurately
+        return -np.expm1(exponent) / self.S_l**2
+    
+    def compute_T(self, R):
+        """
+        Compute T based on R.
+        
+        Args:
+            R (float): R parameter
+            
+        Returns:
+            float: T value
+        """
+        return ((self.kappa * self.zeta) / self.tau) * R
+    
+    def compute_p_l(self, R, p_rr, eta, gamma_prev, sigma):
+        """
+        Compute p_l based on the piecewise function.
+        
+        Args:
+            R (float): R parameter
+            p_rr (float): p_rr value
+            eta (float): eta value
+            gamma_prev (float): gamma_(l-1) value
+            sigma (float): sigma value
+            
+        Returns:
+            float: p_l value
+        """
+        R_choose_2 = comb(R, 2)
+        
+        if eta <= R_choose_2 * p_rr:
+            return min(1, (1 - self.g_function(R, p_rr, eta)) * (gamma_prev**(2*sigma)))
+        else:
+            g_val = self.g_function(R, p_rr, eta)
+            denominator = np.sqrt(2*R_choose_2)
+            return min(1, (g_val / denominator) * (gamma_prev**(2*sigma)))
+    
+    def compute_gamma_l(self, p_l):
+        """
+        Compute gamma_l using the Lambert W function.
+        
+        Args:
+            p_l (float): p_l value
+            
+        Returns:
+            float: gamma_l value
+        """
+        z = -p_l * self.S_l * np.exp(-p_l * self.S_l)
+        w_val = np.real(lambertw(z, k=0))
+        gamma_l = 1 + (1 / (p_l * self.S_l)) * w_val
+        # If gamma_l is nan, set it to 0
+        if np.isnan(gamma_l):
+            gamma_l = 0
+        return gamma_l
+    
+    def compute_recursive_values(self, R, l_max=None):
+        """
+        Compute p_l and gamma_l recursively for all levels up to l_max.
+        
+        Args:
+            R (float): R parameter
+            l_max (int, optional): Maximum level. Defaults to self.L_max.
+            
+        Returns:
+            tuple: (p_values, gamma_values)
+        """
+        if l_max is None:
+            l_max = self.L_max
+            
+        # Initialize with base conditions
+        gamma_values = [1.0]  # gamma_0 = 1
+        p_values = [0.0]      # placeholder for p_0 (not used)
+        
+        # Calculate T based on R
+        T = self.compute_T(R)
+        
+        # Calculate p_rr
+        p_rr = self.compute_p_rr(R, T, self.d_t)
+        
+        # Recursively compute p_l and gamma_l for each level
+        for l in range(1, l_max + 1):
+            gamma_prev = gamma_values[l-1]
+            sigma = self.sigma_l(l)
+            eta = self.eta_l(l)
+            
+            p_l = self.compute_p_l(R, p_rr, eta, gamma_prev, sigma)
+            p_values.append(p_l)
+            
+            gamma_l = self.compute_gamma_l(p_l)
+            gamma_values.append(gamma_l)
+        
+        return p_values, gamma_values
+    
+    def compute_m_l_prime(self, l, l_prime, m):
+        """
+        Compute m_l' based on the given formula.
+        
+        Args:
+            l (int): Skill level
+            l_prime (int): Target skill level
+            m (int): Original m value
+            
+        Returns:
+            float: m_l' value
+        """
+        if l_prime > l:
+            # Calculate the product term in the denominator
+            prod = 1
+            for k in range(l+1, l_prime+1):
+                prod *= self.sigma_l(k)
+            result = max(np.ceil(m / prod), 2)
+        elif l_prime == l:
+            result = m
+        else:  # l_prime < l
+            # Calculate the product term
+            prod = 1
+            for k in range(l_prime+1, l+1):
+                prod *= self.sigma_l(k)
+            result = np.ceil(m * prod)
+        
+        return result
+    
+    def compute_M_l_prime(self, m_l_prime):
+        """
+        Compute M_l' based on m_l'.
+        
+        Args:
+            m_l_prime (float): m_l' value
+            
+        Returns:
+            float: M_l' value
+        """
+        return np.ceil(m_l_prime + self.beta * m_l_prime)
+    
+    def compute_training_cost(self, R):
+        """
+        Compute the training cost C_tr.
+        
+        Args:
+            R (float): R parameter
+            
+        Returns:
+            float: Training cost
+        """
+        return 6 * self.kappa * self.zeta**2 * R**2
+    
+    # =========================================================================
+    # POLICY-SPECIFIC FUNCTIONS
+    # =========================================================================
+    
+    def compute_inference_cost(self, R, N_star):
+        """
+        Compute the inference cost based on the current policy.
+        
+        Args:
+            R (float): R parameter
+            N_star (float): N* value
+            
+        Returns:
+            float: Inference cost
+        """
+        if self.policy_type == InferencePolicy.COT:
+            return self.compute_inference_cost_COT(R, N_star)
+        elif self.policy_type == InferencePolicy.BEST_OF_N:
+            return self.compute_inference_cost_best_of_N(R, N_star)
+        elif self.policy_type == InferencePolicy.MARKOV_TREE_SEARCH:
+            return self.compute_inference_cost_markov_tree_search(R, N_star)
+        elif self.policy_type == InferencePolicy.ConsensusModel:
+            return self.compute_inference_cost_consensus(R, N_star)
+        else:
+            raise ValueError(f"Unsupported policy type: {self.policy_type}")
+    
+    def compute_accuracy(self, gamma_l_star, m_l_star, r_l_star, N_star):
+        """
+        Compute the accuracy based on the current policy.
+        
+        Args:
+            gamma_l_star (float): gamma_l* value
+            m_l_star (float): m_l* value
+            r_l_star (float): r_l* value
+            N_star (float): N* value
+            
+        Returns:
+            float: Accuracy
+        """
+        if self.policy_type == InferencePolicy.COT:
+            return self.compute_accuracy_COT(gamma_l_star, m_l_star, r_l_star, N_star)
+        elif self.policy_type == InferencePolicy.BEST_OF_N:
+            return self.compute_accuracy_best_of_N(gamma_l_star, m_l_star, r_l_star, N_star)
+        elif self.policy_type == InferencePolicy.MARKOV_TREE_SEARCH:
+            return self.compute_accuracy_markov_tree_search(gamma_l_star, m_l_star, r_l_star, N_star)
+        elif self.policy_type == InferencePolicy.ConsensusModel:
+            return self.compute_accuracy_consensus(gamma_l_star, m_l_star, r_l_star, N_star)
+        else:
+            raise ValueError(f"Unsupported policy type: {self.policy_type}")
+    
+    
+    def compute_expected_steps_variable_cot(self, gamma_l_star, m_l_star, r_l_star, K_max):
+        """
+        Compute the expected number of steps needed for variable Chain of Thought.
+        Based on the formula:
+        E[K|m,r_CoT,K_max]= sum(k=m to K_max) k * (gamma^m * I_r(m,k-m+1) - gamma^m * I_r(m,k-m))
+                            + K_max * (1 - gamma^m * I_r(m,K_max-m+1))
+        
+        Args:
+            gamma_l_star (float): gamma_l* value
+            m_l_star (float): m_l* value
+            r_l_star (float): r_l* value
+            K_max (float): Maximum number of steps
+            
+        Returns:
+            float: Expected number of steps
+        """
+        # Initialize
+        expected_steps = 0
+        m = int(np.ceil(m_l_star))  # Ensure m is an integer
+        r = r_l_star
+        gamma = gamma_l_star
+        
+        # Calculate using the summation formula
+        for k in range(m, int(np.ceil(K_max)) + 1):
+            # Calculate beta incomplete for k-m+1 and k-m
+            beta_k_plus_1 = betainc(m, k-m+1, r)
+            beta_k = betainc(m, k-m, r) if k > m else 0
+            
+            # Add to expected steps
+            expected_steps += k * (gamma**m * beta_k_plus_1 - gamma**m * beta_k)
+        
+        # Add the final term for K_max
+        expected_steps += K_max * (1 - gamma**m * betainc(m, K_max-m+1, r))
+        
+        return expected_steps   
+
+    def compute_expected_steps_variable_cot_wrapper(self, l, m, p_values, gamma_values, steps):
+        """
+        Wrapper to compute expected steps for variable CoT based on optimal l_star selection.
+        
+        Args:
+            l (int): Skill level
+            m (int): Difficulty parameter
+            p_values (list): List of p values
+            gamma_values (list): List of gamma values
+            steps (float): Maximum steps allowed
+            
+        Returns:
+            tuple: (expected_steps, optimal_params)
+        """
+        # Find best l_star for this allocation
+        best_accuracy = 0
+        best_expected_steps = steps  # Default to maximum
+        
+        # Find if any p_values is 1 and if so store index
+        p_is_1_index = np.where(np.array(p_values) == 1)[0]
+        l_min = 1 if len(p_is_1_index) == 0 else p_is_1_index[-1]
+
+        optimal_params = {}
+        
+        # Try different l_star values
+        for l_prime in range(l_min, self.L_max + 1):
+            p_l_prime = p_values[l_prime]
+            gamma_l_prime = gamma_values[l_prime]
+            m_l_prime = self.compute_m_l_prime(l, l_prime, m)
+            M_l_prime = self.compute_M_l_prime(m_l_prime)
+            p_eff = p_l_prime * (self.rho / M_l_prime + 1-self.rho)
+            r_l_prime = p_eff * self.q(p_l_prime)
+            
+            # Calculate expected steps using the variable CoT formula
+            expected_steps = self.compute_expected_steps_variable_cot(
+                gamma_l_prime, m_l_prime, r_l_prime, steps)
+            
+            # Calculate accuracy
+            accuracy = self.compute_accuracy_COT(gamma_l_prime, m_l_prime, r_l_prime, steps)
+            
+            if accuracy > best_accuracy:
+                best_accuracy = accuracy
+                best_expected_steps = expected_steps
+                optimal_params = {
+                    'l_star': l_prime,
+                    'm_l_star': m_l_prime,
+                    'r_l_star': r_l_prime,
+                    'gamma_l_star': gamma_l_prime,
+                    'accuracy': accuracy
+                }
+
+            if p_l_prime == 0:
+                break
+        
+        return best_expected_steps, optimal_params
+
+
+    def evaluate_allocation(self, C_tr, C_inf, l, m, p_values=None, gamma_values=None):
+        """
+        Evaluate allocation for fixed l and m based on the current policy.
+        
+        Args:
+            C_tr (float): Training cost
+            C_inf (float): Inference cost
+            l (int): Skill level
+            m (int): Difficulty parameter
+            p_values (list, optional): Pre-computed p values
+            gamma_values (list, optional): Pre-computed gamma values
+            
+        Returns:
+            float: Accuracy
+        """
+        # Ensure p_values and gamma_values are available
+        if p_values is None or gamma_values is None:
+            p_values, gamma_values = self.train(C_tr)
+            
+        if self.policy_type == InferencePolicy.COT:
+            return self.evaluate_allocation_COT(C_tr, C_inf, l, m, p_values, gamma_values)
+        elif self.policy_type == InferencePolicy.BEST_OF_N:
+            return self.evaluate_allocation_best_of_N(C_tr, C_inf, l, m, p_values, gamma_values)
+        elif self.policy_type == InferencePolicy.MARKOV_TREE_SEARCH:
+            return self.evaluate_allocation_markov_tree_search(C_tr, C_inf, l, m, p_values, gamma_values)
+        elif hasattr(InferencePolicy, 'CONSENSUS') and self.policy_type == InferencePolicy.CONSENSUS:
+            return self.evaluate_allocation_consensus(C_tr, C_inf, l, m, p_values, gamma_values)
+        else:
+            raise ValueError(f"Unsupported policy type: {self.policy_type}")    
+
+    def compute_inference_cost_COT(self, R, N_star):
+        """
+        Updated to use the variable CoT formula for expected steps.
+        
+        Args:
+            R (float): R parameter
+            N_star (float): N* value
+            
+        Returns:
+            float: Inference cost
+        """
+        # Try to get optimal parameters from instance
+        if hasattr(self, '_optimal_params') and self._optimal_params:
+            gamma_l_star = self._optimal_params.get('gamma_l_star')
+            m_l_star = self._optimal_params.get('m_l_star')
+            r_l_star = self._optimal_params.get('r_l_star')
+            
+            if gamma_l_star and m_l_star and r_l_star:
+                # Compute expected steps using the variable CoT formula
+                expected_steps = self.compute_expected_steps_variable_cot(
+                    gamma_l_star, m_l_star, r_l_star, N_star)
+                return 2 * self.zeta * R * self.omega * expected_steps
+        
+        # Fallback to original formula if optimal params not available
+        return 2 * self.zeta * R * self.omega * N_star
+
+    def compute_inference_cost_best_of_N(self, R, N_star):
+        """
+        Compute the inference cost for Best of N.
+        
+        Args:
+            R (float): R parameter
+            N_star (float): N* value
+            
+        Returns:
+            float: Inference cost
+        """
+        # Get n_samples from policy_params
+        n_samples = self.policy_params.get('n_samples', 3)
+        
+        # For Best of N, the total inference cost is the base cost multiplied by n_samples
+        # Each sample gets an equal portion of the total steps budget
+        base_cost = self.compute_inference_cost_COT(R, N_star / n_samples)
+        
+        return n_samples * base_cost
+
+    def compute_inference_cost_markov_tree_search(self, R, N_star):
+        """
+        Compute the inference cost for Markov Tree Search.
+        
+        Args:
+            R (float): R parameter
+            N_star (float): N* value
+            
+        Returns:
+            float: Inference cost
+        """
+        # Get parameters from policy_params
+        branching_factor = self.policy_params.get('branching_factor', 3)
+        
+        # Try to get optimal parameters from instance
+        if hasattr(self, '_optimal_params') and self._optimal_params:
+            gamma_l_star = self._optimal_params.get('gamma_l_star')
+            m_l_star = self._optimal_params.get('m_l_star')
+            r_l_star = self._optimal_params.get('r_l_star')
+            
+            if gamma_l_star and m_l_star and r_l_star:
+                # Improved r for MCTS using the formula r_MCTS = 1-(1-r_CoT)^b
+                r_mcts = 1 - (1 - r_l_star) ** branching_factor
+                
+                # Effective number of steps for MCTS
+                K_max = N_star / branching_factor
+                
+                # Compute expected steps for MCTS
+                expected_steps = self.compute_expected_steps_variable_cot(
+                    gamma_l_star, m_l_star, r_mcts, K_max)
+                
+                # Scale by branching factor
+                expected_steps *= branching_factor
+                
+                return 2 * self.zeta * R * self.omega * expected_steps
+        
+        # Fallback to original CoT formula with adjustment for branching factor
+        base_cost = self.compute_inference_cost_COT(R, N_star / branching_factor)
+        return base_cost * branching_factor
+    
+    def compute_accuracy_consensus(self, gamma_l_star, m_l_star, r_l_star, N_star):
+        """
+        Compute the accuracy for Consensus Model.
+        
+        Args:
+            gamma_l_star (float): gamma_l* value
+            m_l_star (float): m_l* value
+            r_l_star (float): r_l* value
+            N_star (float): N* value
+            
+        Returns:
+            float: Accuracy
+        """
+        # Consensus model accuracy is similar to CoT but with a consensus mechanism
+        # For simplicity, we can use the same formula as CoT for now
+        return (gamma_l_star ** m_l_star) * betainc(m_l_star, N_star - m_l_star + 1, r_l_star)
+
+    def compute_accuracy_COT(self, gamma_l_star, m_l_star, r_l_star, N_star):
+        """
+        Compute the accuracy for Chain of Thought.
+        
+        Args:
+            gamma_l_star (float): gamma_l* value
+            m_l_star (float): m_l* value
+            r_l_star (float): r_l* value
+            N_star (float): N* value
+            
+        Returns:
+            float: Accuracy
+        """
+        return (gamma_l_star ** m_l_star) * betainc(m_l_star, N_star - m_l_star + 1, r_l_star)
+
+    def compute_accuracy_best_of_N(self, gamma_l_star, m_l_star, r_l_star, N_star):
+        """
+        Compute the accuracy for Best of N.
+        
+        Args:
+            gamma_l_star (float): gamma_l* value
+            m_l_star (float): m_l* value
+            r_l_star (float): r_l* value
+            N_star (float): N* value
+            
+        Returns:
+            float: Accuracy
+        """
+        # Get n_samples from policy_params
+        n_samples = self.policy_params.get('n_samples', 3)
+        
+        # Base accuracy with budget divided equally among samples
+        base_accuracy = self.compute_accuracy_COT(gamma_l_star, m_l_star, r_l_star, N_star / n_samples)
+        
+        # Best-of-N accuracy: probability that at least one of N samples is correct
+        # P(at least one correct) = 1 - P(all incorrect) = 1 - (1-p)^N
+        best_of_n_accuracy = 1 - (1 - base_accuracy) ** n_samples
+        
+        return best_of_n_accuracy
+
+    def compute_accuracy_markov_tree_search(self, gamma_l_star, m_l_star, r_l_star, N_star):
+        """
+        Compute the accuracy for Markov Tree Search.
+        
+        Args:
+            gamma_l_star (float): gamma_l* value
+            m_l_star (float): m_l* value
+            r_l_star (float): r_l* value
+            N_star (float): N* value
+            
+        Returns:
+            float: Accuracy
+        """
+        # Get parameters from policy_params
+        branching_factor = self.policy_params.get('branching_factor', 3)
+        
+        # Improved r for MCTS using the formula r_MCTS = 1-(1-r_CoT)^b
+        r_mcts = 1 - (1 - r_l_star) ** branching_factor
+        
+        # Effective number of steps for MCTS (each step now evaluates b nodes)
+        effective_N_star = N_star / branching_factor
+        
+        # Base accuracy using improved r_mcts and reduced effective steps
+        mcts_accuracy = self.compute_accuracy_COT(gamma_l_star, m_l_star, r_mcts, effective_N_star)
+        
+        return mcts_accuracy
+    
+    def compute_accuracy_consensus_model(self, gamma_l_star, m_l_star, r_l_star, N_star):
+        """
+        Compute the accuracy for Consensus Model.
+        
+        Args:
+            gamma_l_star (float): gamma_l* value
+            m_l_star (float): m_l* value
+            r_l_star (float): r_l* value
+            N_star (float): N* value
+            
+        Returns:
+            float: Accuracy
+        """
+        # Consensus model accuracy is similar to CoT but with a consensus mechanism
+        # For simplicity, we can use the same formula as CoT for now
+        return (gamma_l_star ** m_l_star) * betainc(m_l_star, N_star - m_l_star + 1, r_l_star)
+    
+    # =========================================================================
+    # EVALUATION FUNCTIONS
+    # =========================================================================
+    
+    def train(self, C_tr):
+        """
+        Train the model and evaluate accuracy for a given allocation of C_tr.
+        
+        Args:
+            C_tr (float): Training cost
+            
+        Returns:
+            tuple: (p_values, gamma_values)
+        """
+        # Calculate R from C_tr
+        R = np.sqrt(C_tr / (6 * self.kappa * self.zeta**2))
+        
+        # Compute recursive values
+        p_values, gamma_values = self.compute_recursive_values(R, l_max=self.L_max)
+        
+        # Cache the values
+        self._p_values = p_values
+        self._gamma_values = gamma_values
+
+        return p_values, gamma_values
+    
+    
+    def evaluate_allocation_COT(self, C_tr, C_inf, l, m, p_values=None, gamma_values=None):
+        """
+        Evaluate allocation for Chain of Thought with fixed l and m.
+        
+        Args:
+            C_tr (float): Training cost
+            C_inf (float): Inference cost
+            l (int): Skill level
+            m (int): Difficulty parameter
+            p_values (list, optional): Pre-computed p values
+            gamma_values (list, optional): Pre-computed gamma values
+            
+        Returns:
+            float: Accuracy
+        """
+        # Ensure p_values and gamma_values are available
+        if p_values is None or gamma_values is None:
+            p_values, gamma_values = self.train(C_tr)
+            
+        # Calculate R from C_tr
+        R = np.sqrt(C_tr / (6 * self.kappa * self.zeta**2))
+
+        # Compute steps from C_inf
+        steps = C_inf / (2 * self.zeta * R * self.omega)
+
+        # Find best l_star for this allocation
+        best_accuracy = 0
+        
+        # Find if any p_values is 1 and if so store index
+        p_is_1_index = np.where(np.array(p_values) == 1)[0]
+        l_min = 1 if len(p_is_1_index) == 0 else p_is_1_index[-1]
+
+        optimal_params = {}
+        # Try different l_star values
+        for l_prime in range(l_min, self.L_max + 1):
+            p_l_prime = p_values[l_prime]
+            gamma_l_prime = gamma_values[l_prime]
+            m_l_prime = self.compute_m_l_prime(l, l_prime, m)
+            M_l_prime = self.compute_M_l_prime(m_l_prime)
+            p_eff = p_l_prime * (self.rho / M_l_prime + 1-self.rho)
+            r_l_prime = p_eff * self.q(p_l_prime) # Note that q(p) is a function of p
+            
+            # Calculate accuracy
+            accuracy = self.compute_accuracy_COT(gamma_l_prime, m_l_prime, r_l_prime, steps)
+            
+            if accuracy > best_accuracy:
+                best_accuracy = accuracy
+                optimal_params = {
+                    'l_star': l_prime,
+                    'm_l_star': m_l_prime,
+                    'r_l_star': r_l_prime,
+                    'gamma_l_star': gamma_l_prime
+                }
+
+            if p_l_prime == 0:
+                break
+        
+        # Store optimal parameters for later use
+        self._optimal_params = optimal_params
+
+        return best_accuracy
+    
+    def evaluate_allocation_best_of_N(self, C_tr, C_inf, l, m, p_values=None, gamma_values=None):
+        """
+        Evaluate allocation with Best of N for fixed l and m.
+        
+        Args:
+            C_tr (float): Training cost
+            C_inf (float): Inference cost
+            l (int): Skill level
+            m (int): Difficulty parameter
+            p_values (list, optional): Pre-computed p values
+            gamma_values (list, optional): Pre-computed gamma values
+            
+        Returns:
+            float: Accuracy
+        """
+        # Default implementation same as COT
+        # Override in subclass for custom implementation
+        return self.evaluate_allocation_COT(C_tr, C_inf, l, m, p_values, gamma_values)
+    
+    def evaluate_allocation_markov_tree_search(self, C_tr, C_inf, l, m, p_values=None, gamma_values=None):
+        """
+        Evaluate allocation with Markov Tree Search for fixed l and m.
+        
+        Args:
+            C_tr (float): Training cost
+            C_inf (float): Inference cost
+            l (int): Skill level
+            m (int): Difficulty parameter
+            p_values (list, optional): Pre-computed p values
+            gamma_values (list, optional): Pre-computed gamma values
+            
+        Returns:
+            float: Accuracy
+        """
+        # Default implementation same as COT
+        # Override in subclass for custom implementation
+        return self.evaluate_allocation_COT(C_tr, C_inf, l, m, p_values, gamma_values)
+    
+    def evaluate_allocation_all(self, C_tr, C_inf):
+        """
+        Evaluate accuracy for all possible values of l and m based on the current policy.
+        
+        Args:
+            C_tr (float): Training cost
+            C_inf (float): Inference cost
+            
+        Returns:
+            float: Expected accuracy
+        """
+        if self.policy_type == InferencePolicy.COT:
+            return self.evaluate_allocation_all_COT(C_tr, C_inf)
+        elif self.policy_type == InferencePolicy.BEST_OF_N:
+            return self.evaluate_allocation_all_best_of_N(C_tr, C_inf)
+        elif self.policy_type == InferencePolicy.MARKOV_TREE_SEARCH:
+            return self.evaluate_allocation_all_markov_tree_search(C_tr, C_inf)
+        elif self.policy_type == InferencePolicy.CONSENSUS:
+            return self.evaluate_allocation_all_consensus(C_tr, C_inf)
+        else:
+            raise ValueError(f"Unsupported policy type: {self.policy_type}")
+    
+    def evaluate_allocation_all_COT(self, C_tr, C_inf):
+        """
+        Evaluate accuracy for all possible values of l and m for COT.
+        
+        Args:
+            C_tr (float): Training cost
+            C_inf (float): Inference cost
+            
+        Returns:
+            float: Expected accuracy
+        """
+        # Initialize accuracy matrix
+        expected_accuracy = 0
+        
+        # Compute p_values and gamma_values
+        p_values, gamma_values = self.train(C_tr)
+
+        # Iterate over all possible values of l and m
+        for l in range(self.L_min, self.L_max+1):
+            for m in range(self.m_min, self.m_max+1):
+                # Note the corrected parameter order - l and m come before p_values and gamma_values
+                expected_accuracy += self.phi(l,m) * self.evaluate_allocation_COT(C_tr, C_inf, l, m, p_values, gamma_values)
+        
+        return expected_accuracy
+
+    # Need to fix all the other evaluate_allocation_all_X methods as well
+    def evaluate_allocation_all_best_of_N(self, C_tr, C_inf):
+        """
+        Evaluate accuracy for all possible values of l and m with Best of N.
+        
+        Args:
+            C_tr (float): Training cost
+            C_inf (float): Inference cost
+            
+        Returns:
+            float: Expected accuracy
+        """
+        # Initialize accuracy matrix
+        expected_accuracy = 0
+        
+        # Compute p_values and gamma_values
+        p_values, gamma_values = self.train(C_tr)
+
+        # Iterate over all possible values of l and m
+        for l in range(self.L_min, self.L_max+1):
+            for m in range(self.m_min, self.m_max+1):
+                # Note the corrected parameter order - l and m come before p_values and gamma_values
+                expected_accuracy += self.phi(l,m) * self.evaluate_allocation_best_of_N(C_tr, C_inf, l, m, p_values, gamma_values)
+        
+        return expected_accuracy
+
+    def evaluate_allocation_all_markov_tree_search(self, C_tr, C_inf):
+        """
+        Evaluate accuracy for all possible values of l and m with Markov Tree Search.
+        
+        Args:
+            C_tr (float): Training cost
+            C_inf (float): Inference cost
+            
+        Returns:
+            float: Expected accuracy
+        """
+        # Initialize accuracy matrix
+        expected_accuracy = 0
+        
+        # Compute p_values and gamma_values
+        p_values, gamma_values = self.train(C_tr)
+
+        # Iterate over all possible values of l and m
+        for l in range(self.L_min, self.L_max+1):
+            for m in range(self.m_min, self.m_max+1):
+                # Note the corrected parameter order - l and m come before p_values and gamma_values
+                expected_accuracy += self.phi(l,m) * self.evaluate_allocation_markov_tree_search(C_tr, C_inf, l, m, p_values, gamma_values)
+        
+        return expected_accuracy
+
+    def evaluate_allocation_all_consensus(self, C_tr, C_inf):
+        """
+        Evaluate accuracy for all possible values of l and m with Consensus.
+        
+        Args:
+            C_tr (float): Training cost
+            C_inf (float): Inference cost
+            
+        Returns:
+            float: Expected accuracy
+        """
+        # Initialize accuracy matrix
+        expected_accuracy = 0
+        
+        # Compute p_values and gamma_values
+        p_values, gamma_values = self.train(C_tr)
+
+        # Iterate over all possible values of l and m
+        for l in range(self.L_min, self.L_max+1):
+            for m in range(self.m_min, self.m_max+1):
+                # Note the corrected parameter order - l and m come before p_values and gamma_values
+                expected_accuracy += self.phi(l,m) * self.evaluate_allocation_consensus(C_tr, C_inf, l, m, p_values, gamma_values)
+        
+        return expected_accuracy
+    
+    def find_optimal_allocation(self, total_budget, n_steps=10):
+        """
+        Find the optimal allocation of resources between training and inference.
+        
+        Args:
+            total_budget (float): Total computational budget
+            n_steps (int, optional): Number of steps to evaluate. Defaults to 10.
+            
+        Returns:
+            tuple: (optimal_C_tr, optimal_C_inf, best_accuracy)
+        """
+        best_accuracy = 0
+        optimal_C_tr = 0
+        optimal_C_inf = total_budget
+        
+        # Try different allocations
+        for i in range(n_steps + 1):
+            C_tr = (i / n_steps) * total_budget
+            C_inf = total_budget - C_tr
+            
+            # Skip if either cost is too small
+            if C_tr < 1e-6 or C_inf < 1e-6:
+                continue
+                
+            # Train the model
+            self.train(C_tr)
+            
+            # Evaluate accuracy
+            accuracy = self.evaluate_allocation_all(C_tr, C_inf)
+            
+            if accuracy > best_accuracy:
+                best_accuracy = accuracy
+                optimal_C_tr = C_tr
+                optimal_C_inf = C_inf
+        
+        return optimal_C_tr, optimal_C_inf, best_accuracy
+    
+    # =========================================================================
+    # DATA COLLECTION AND VISUALIZATION FUNCTIONS
+    # =========================================================================
+    
+    def evaluate_grid(self, C_tr_values, C_inf_values, output_file=None, replace=False):
+        """
+        Evaluate accuracy for all combinations of C_tr and C_inf and store in a DataFrame.
+        
+        Args:
+            C_tr_values (list): List of training costs to evaluate
+            C_inf_values (list): List of inference costs to evaluate
+            output_file (str, optional): CSV file to save results
+            replace (bool, optional): Whether to replace existing results
+            
+        Returns:
+            pandas.DataFrame: DataFrame with results
+        """
+        # Import tqdm for progress tracking
+        try:
+            from tqdm import tqdm
+        except ImportError:
+            # If tqdm is not available, create a simple replacement
+            def tqdm(iterable, **kwargs):
+                return iterable
+            print("Note: Install tqdm package for progress bars")
+        
+        # Initialize or load accuracy DataFrame
+        if output_file and os.path.exists(output_file):
+            try:
+                accuracy_df = pd.read_csv(output_file)
+                # Ensure all required columns exist
+                for col in ['C_tr', 'C_inf', 'Accuracy', 'Policy', 'Params', 'Tokens']:
+                    if col not in accuracy_df.columns:
+                        accuracy_df[col] = None  # Add the column with None values
+            except Exception as e:
+                print(f"Error reading existing file: {e}")
+                accuracy_df = pd.DataFrame(columns=['C_tr', 'C_inf', 'Accuracy', 'Policy', 'Params', 'Tokens'])
+        else:
+            accuracy_df = pd.DataFrame(columns=['C_tr', 'C_inf', 'Accuracy', 'Policy', 'Params', 'Tokens'])
+        
+        # Policy identifier
+        policy_id = self.policy_type.value
+        
+        # Track statistics for reporting
+        total_combinations = len(C_tr_values) * len(C_inf_values)
+        processed = 0
+        skipped = 0
+        
+        # Evaluate for all combinations with progress bar
+        for C_tr in tqdm(C_tr_values, desc="Training costs", ncols=100):
+            # Compute once for this C_tr
+            self.train(C_tr)
+            
+            # Calculate R (params) based on C_tr
+            params = np.sqrt(C_tr / (6 * self.kappa * self.zeta**2))
+            
+            # Use nested progress bar for inference costs
+            for C_inf in tqdm(C_inf_values, desc=f"  Inference costs (C_tr={C_tr:.2e})", 
+                            leave=False, ncols=100):
+                # Check if this combination already exists and we're not replacing
+                if not replace and 'Policy' in accuracy_df.columns:
+                    matching_rows = ((accuracy_df['C_tr'] == C_tr) & 
+                                    (accuracy_df['C_inf'] == C_inf) & 
+                                    (accuracy_df['Policy'] == policy_id))
+                    if matching_rows.any():
+                        skipped += 1
+                        continue
+                
+                # Calculate tokens based on C_inf and params
+                tokens = C_inf / (2 * params * self.omega)
+                
+                # Evaluate accuracy
+                accuracy = self.evaluate_allocation_all(C_tr, C_inf)
+                processed += 1
+                
+                # Remove existing row if replacing
+                if replace and 'Policy' in accuracy_df.columns:
+                    accuracy_df = accuracy_df.loc[~((accuracy_df['C_tr'] == C_tr) & 
+                                                (accuracy_df['C_inf'] == C_inf) & 
+                                                (accuracy_df['Policy'] == policy_id))]
+                
+                # Add result to DataFrame
+                new_row = pd.DataFrame({
+                    'C_tr': [C_tr], 
+                    'C_inf': [C_inf], 
+                    'Accuracy': [accuracy],
+                    'Policy': [policy_id],
+                    'Params': [params],
+                    'Tokens': [tokens]
+                })
+                accuracy_df = pd.concat([accuracy_df, new_row], ignore_index=True)
+                
+                # Save after each evaluation
+                if output_file:
+                    accuracy_df.to_csv(output_file, index=False)
+        
+        print(f"Completed: {processed} combinations processed, {skipped} combinations skipped.")
+        return accuracy_df
+    
+    def plot_accuracy_vs_C_inf(self, accuracy_df=None, C_tr_values=None, figsize=(10, 6), save_path=None):
+        """
+        Plot accuracy as a function of inference cost for different training costs.
+        
+        Args:
+            accuracy_df (pandas.DataFrame, optional): DataFrame with results
+            C_tr_values (list, optional): Specific training costs to plot
+            figsize (tuple, optional): Figure size
+            save_path (str, optional): Path to save the figure
+            
+        Returns:
+            matplotlib.figure.Figure: The generated figure
+        """
+        # Check if we have data
+        if accuracy_df is None:
+            raise ValueError("No data provided. Please provide accuracy_df.")
+        
+        # Filter by policy
+        policy_id = self.policy_type.value
+        df = accuracy_df[accuracy_df['Policy'] == policy_id].copy()
+        
+        # No data for this policy
+        if len(df) == 0:
+            raise ValueError(f"No data found for policy {policy_id}")
+        
+        # Filter specific C_tr values if provided
+        if C_tr_values:
+            df = df[df['C_tr'].isin(C_tr_values)].copy()
+        
+        # Sort the dataframe
+        df = df.sort_values(["C_tr", "C_inf"])
+        
+        # Create the figure and axis
+        fig, ax = plt.subplots(figsize=figsize)
+        
+        # Plot each C_tr as a separate curve
+        for C_tr, group in df.groupby("C_tr"):
+            ax.plot(group["C_inf"], group["Accuracy"], marker='o', label=f'{C_tr:.2e}')
+        
+        # Add legend
+        ax.legend(title="Training Compute")
+        
+        # Set log scale
+        ax.set_xscale('log')
+        
+        # Labels
+        ax.set_xlabel("Inference Compute")
+        ax.set_ylabel("Expected Accuracy")
+        ax.set_title(f"Expected Accuracy vs Inference Compute ({policy_id})")
+        
+        # Get data range
+        min_x = df["C_inf"].min()
+        max_x = df["C_inf"].max()
+        
+        # Expand the x limits slightly to ensure visibility
+        log_min = np.floor(np.log10(min_x))
+        log_max = np.ceil(np.log10(max_x))
+        ax.set_xlim(10**log_min, 10**log_max)
+        
+        # Force grid to be behind the data
+        ax.set_axisbelow(True)
+        
+        # COMPLETELY DIFFERENT APPROACH TO GRID LINES:
+        # 1. First clear any automatic grid
+        ax.grid(False)
+        
+        # 2. Manually draw major grid lines at powers of 10
+        major_ticks = [10**i for i in range(int(log_min), int(log_max)+1)]
+        for tick in major_ticks:
+            ax.axvline(x=tick, color='black', linestyle='-', linewidth=0.7, alpha=0.4, zorder=0)
+        
+        # 3. Manually draw minor grid lines
+        for decade in range(int(log_min), int(log_max)+1):
+            for i in [2, 3, 4, 5, 6, 7, 8, 9]:
+                ax.axvline(x=i*10**decade, color='gray', linestyle=':', linewidth=0.7, alpha=0.6, zorder=0)
+        
+        # Configure major ticks (powers of 10)
+        ax.xaxis.set_major_locator(ticker.LogLocator(base=10))
+        
+        # Configure minor ticks in between powers of 10
+        ax.xaxis.set_minor_locator(ticker.LogLocator(base=10, subs=[2,3,4,5,6,7,8,9]))
+        
+        # Optionally remove labels from minor ticks
+        ax.xaxis.set_minor_formatter(ticker.NullFormatter())
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300)
+        
+        return fig
+    
+    def plot_accuracy_vs_C_tr(self, accuracy_df=None, C_inf_values=None, figsize=(10, 6), save_path=None):
+        """
+        Plot accuracy as a function of training cost for different inference costs.
+        
+        Args:
+            accuracy_df (pandas.DataFrame, optional): DataFrame with results
+            C_inf_values (list, optional): Specific inference costs to plot
+            figsize (tuple, optional): Figure size
+            save_path (str, optional): Path to save the figure
+            
+        Returns:
+            matplotlib.figure.Figure: The generated figure
+        """
+        # Check if we have data
+        if accuracy_df is None:
+            raise ValueError("No data provided. Please provide accuracy_df.")
+        
+        # Filter by policy
+        policy_id = self.policy_type.value
+        df = accuracy_df[accuracy_df['Policy'] == policy_id].copy()
+        
+        # No data for this policy
+        if len(df) == 0:
+            raise ValueError(f"No data found for policy {policy_id}")
+        
+        # Filter specific C_inf values if provided
+        if C_inf_values:
+            df = df[df['C_inf'].isin(C_inf_values)].copy()
+        
+        # Sort the dataframe by C_inf
+        df = df.sort_values(["C_inf", "C_tr"])
+        
+        # Create the figure and axis
+        fig, ax = plt.subplots(figsize=figsize)
+        
+        # Plot each C_inf as a separate curve
+        for C_inf, group in df.groupby("C_inf"):
+            ax.plot(group["C_tr"], group["Accuracy"], marker='o', label=f'{C_inf:.2e}')
+        
+        # Add legend
+        ax.legend(title="Inference Compute")
+        
+        # Set log scale
+        ax.set_xscale('log')
+        
+        # Labels
+        ax.set_xlabel("Training Compute")
+        ax.set_ylabel("Expected Accuracy")
+        ax.set_title(f"Expected Accuracy vs Training Compute ({policy_id})")
+        
+        # Get data range
+        min_x = df["C_tr"].min()
+        max_x = df["C_tr"].max()
+        
+        # Expand the x limits slightly to ensure visibility
+        log_min = np.floor(np.log10(min_x))
+        log_max = np.ceil(np.log10(max_x))
+        ax.set_xlim(10**log_min, 10**log_max)
+        
+        # Force grid to be behind the data
+        ax.set_axisbelow(True)
+        
+        # Enable major and minor grid
+        ax.grid(True, which='major', color='black', linestyle='-', linewidth=0.7, alpha=0.4)
+        ax.grid(True, which='minor', color='gray', linestyle=':', linewidth=0.7, alpha=0.6)
+        
+        # Configure major ticks (powers of 10)
+        ax.xaxis.set_major_locator(ticker.LogLocator(base=10, numticks=10))
+        
+        # Configure minor ticks in between powers of 10 (2,3,4,5,6,7,8,9)
+        ax.xaxis.set_minor_locator(ticker.LogLocator(base=10, subs=[2,3,4,5,6,7,8,9], numticks=12))
+        
+        # Optionally remove labels from minor ticks
+        ax.xaxis.set_minor_formatter(ticker.NullFormatter())
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300)
+        
+        return fig
+    
+    def plot_accuracy_vs_tokens(self, accuracy_df=None, C_tr_values=None, figsize=(10, 6), save_path=None):
+        """
+        Plot accuracy as a function of inference tokens for different training costs.
+        
+        Args:
+            accuracy_df (pandas.DataFrame, optional): DataFrame with results
+            C_tr_values (list, optional): Specific training costs to plot
+            figsize (tuple, optional): Figure size
+            save_path (str, optional): Path to save the figure
+            
+        Returns:
+            matplotlib.figure.Figure: The generated figure
+        """
+        # Check if we have data
+        if accuracy_df is None:
+            raise ValueError("No data provided. Please provide accuracy_df.")
+        
+        # Filter by policy
+        policy_id = self.policy_type.value
+        df = accuracy_df[accuracy_df['Policy'] == policy_id].copy()
+        
+        # No data for this policy
+        if len(df) == 0:
+            raise ValueError(f"No data found for policy {policy_id}")
+        
+        # Filter specific C_tr values if provided
+        if C_tr_values:
+            df = df[df['C_tr'].isin(C_tr_values)].copy()
+        
+        # Sort the dataframe
+        df = df.sort_values(["C_tr", "Tokens"])
+        
+        # Create the figure and axis
+        fig, ax = plt.subplots(figsize=figsize)
+        
+        # Plot each C_tr as a separate curve
+        for C_tr, group in df.groupby("C_tr"):
+            ax.plot(group["Tokens"], group["Accuracy"], marker='o', label=f'{C_tr:.2e}')
+        
+        # Add legend
+        ax.legend(title="Training Compute")
+        
+        # Set log scale for x-axis
+        ax.set_xscale('log')
+        
+        # Labels
+        ax.set_xlabel("Inference Tokens")
+        ax.set_ylabel("Expected Accuracy")
+        ax.set_title(f"Expected Accuracy vs Inference Tokens ({policy_id})")
+        
+        # Get data range
+        min_x = df["Tokens"].min()
+        max_x = df["Tokens"].max()
+        
+        # Expand the x limits slightly to ensure visibility
+        log_min = np.floor(np.log10(min_x))
+        log_max = np.ceil(np.log10(max_x))
+        ax.set_xlim(10**log_min, 10**log_max)
+        
+        # Force grid to be behind the data
+        ax.set_axisbelow(True)
+        
+        # Draw major grid lines at powers of 10
+        major_ticks = [10**i for i in range(int(log_min), int(log_max)+1)]
+        for tick in major_ticks:
+            ax.axvline(x=tick, color='black', linestyle='-', linewidth=0.7, alpha=0.4, zorder=0)
+        
+        # Draw minor grid lines
+        for decade in range(int(log_min), int(log_max)+1):
+            for i in [2, 3, 4, 5, 6, 7, 8, 9]:
+                ax.axvline(x=i*10**decade, color='gray', linestyle=':', linewidth=0.7, alpha=0.6, zorder=0)
+        
+        # Configure major ticks (powers of 10)
+        ax.xaxis.set_major_locator(ticker.LogLocator(base=10))
+        
+        # Configure minor ticks in between powers of 10
+        ax.xaxis.set_minor_locator(ticker.LogLocator(base=10, subs=[2,3,4,5,6,7,8,9]))
+        
+        # Optionally remove labels from minor ticks
+        ax.xaxis.set_minor_formatter(ticker.NullFormatter())
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300)
+        
+        return fig
+    
+    def plot_contour(self, accuracy_df=None, inference_counts=None, figsize=(12, 10), 
+                     save_path=None, xlim=None, ylim=None):
+        """
+        Create a contour plot of accuracy as a function of training and inference costs.
+        Optionally overlay curves showing optimal allocation for different numbers of tasks.
+        
+        Args:
+            accuracy_df (pandas.DataFrame, optional): DataFrame with results
+            inference_counts (list, optional): List of inference counts to plot optimal curves for
+            figsize (tuple, optional): Figure size
+            save_path (str, optional): Path to save the figure
+            xlim (tuple, optional): x-axis limits (min, max)
+            ylim (tuple, optional): y-axis limits (min, max)
+            
+        Returns:
+            matplotlib.figure.Figure: The generated figure
+        """
+        # Check if we have data
+        if accuracy_df is None:
+            raise ValueError("No data provided. Please provide accuracy_df.")
+        
+        # Filter by policy
+        policy_id = self.policy_type.value
+        df = accuracy_df[accuracy_df['Policy'] == policy_id].copy()
+        
+        # No data for this policy
+        if len(df) == 0:
+            raise ValueError(f"No data found for policy {policy_id}")
+        
+        # Create the figure and axis
+        fig, ax = plt.subplots(figsize=figsize)
+        
+        # Extract data from dataframe
+        C_tr_values = df['C_tr'].values
+        C_inf_values = df['C_inf'].values
+        accuracy_values = df['Accuracy'].values
+        
+        # Create a regular grid for interpolation in log space
+        log_tr_min, log_tr_max = np.log10(C_tr_values.min()), np.log10(C_tr_values.max())
+        log_inf_min, log_inf_max = np.log10(C_inf_values.min()), np.log10(C_inf_values.max())
+        
+        grid_size = 100
+        log_tr_grid = np.linspace(log_tr_min, log_tr_max, grid_size)
+        log_inf_grid = np.linspace(log_inf_min, log_inf_max, grid_size)
+        log_tr_mesh, log_inf_mesh = np.meshgrid(log_tr_grid, log_inf_grid)
+        
+        # Points need to be in log space for better interpolation
+        log_points = np.column_stack((np.log10(C_tr_values), np.log10(C_inf_values)))
+        
+        # Interpolate accuracy values onto the log grid
+        grid_accuracy = griddata(log_points, accuracy_values, (log_tr_mesh, log_inf_mesh), method='linear')
+        
+        # Convert mesh back to linear scale for plotting
+        tr_mesh = 10**log_tr_mesh
+        inf_mesh = 10**log_inf_mesh
+        
+        # Create contour levels excluding values above 0.99
+        min_acc = max(0, accuracy_values.min())
+        max_acc = min(0.99, accuracy_values.max())  # Cap at 0.99
+        levels = np.linspace(min_acc, max_acc, 10)
+        
+        # Define colormap for consistency
+        cmap = plt.cm.viridis
+        
+        # Create colored contour lines with increased transparency
+        contour_lines = ax.contour(tr_mesh, inf_mesh, grid_accuracy, levels=levels, 
+                                  cmap=cmap, linewidths=1.0, alpha=0.7)  # More transparent
+        
+        # Add scatter points with increased transparency
+        scatter = ax.scatter(C_tr_values, C_inf_values, c=accuracy_values, cmap=cmap,
+                            edgecolor='k', s=15, alpha=0.7, zorder=5)  # Smaller and more transparent
+        
+        # Add colorbar
+        cbar = plt.colorbar(scatter)
+        cbar.set_label('Expected Accuracy')
+        cbar.ax.set_yticks(levels)
+        cbar.ax.set_yticklabels([f'{level:.2f}' for level in levels])
+        
+        # Create an interpolator for accuracy as a function of C_tr and C_inf
+        accuracy_interp = LinearNDInterpolator(log_points, accuracy_values)
+        
+        # Define the range of inference counts if provided
+        if inference_counts:
+            # Create a red colormap with progressively darker shades
+            # Use a reversed "Reds" colormap so larger values of I get darker shades
+            red_cmap = cm.get_cmap('Reds')
+            optimal_curve_colors = red_cmap(np.linspace(0.5, 1, len(inference_counts)))
+            
+            # For each inference count, find the optimal compute allocation
+            for i, I in enumerate(inference_counts):
+                # Create a range of total compute values to explore
+                C_tot_values = np.logspace(log_tr_min, log_tr_max + np.log10(I*10**log_inf_max), 50)
+                
+                optimal_tr = []
+                optimal_inf = []
+                optimal_acc = []
+                
+                for C_tot in C_tot_values:
+                    best_acc = 0
+                    best_tr = 0
+                    best_inf = 0
+                    
+                    # Sample different allocations of compute to find optimal
+                    for ratio in np.linspace(0.01, 0.99, 50):
+                        C_tr_test = C_tot * ratio
+                        C_inf_test = (C_tot - C_tr_test) / I
+                        
+                        # Skip if C_inf is too small (below minimum in dataset)
+                        if C_inf_test < 10**log_inf_min:
+                            continue
+                            
+                        # Skip if C_tr is too small (below minimum in dataset)
+                        if C_tr_test < 10**log_tr_min:
+                            continue
+                            
+                        # Skip if values exceed our data range
+                        if np.log10(C_tr_test) > log_tr_max or np.log10(C_inf_test) > log_inf_max:
+                            continue
+                        
+                        # Get predicted accuracy
+                        acc = accuracy_interp(np.log10(C_tr_test), np.log10(C_inf_test))
+                        
+                        # Update if this is better
+                        if not np.isnan(acc) and acc > best_acc:
+                            best_acc = acc
+                            best_tr = C_tr_test
+                            best_inf = C_inf_test
+                
+                # Only add if accuracy is below 0.99 and we found a valid solution
+                if best_acc > 0 and best_acc < .99:
+                    optimal_tr.append(best_tr)
+                    optimal_inf.append(best_inf)
+                    optimal_acc.append(best_acc)
+                
+                # Plot the optimal curve with thicker lines to stand out
+                if optimal_tr:  # Only if we have valid points
+                    ax.plot(optimal_tr, optimal_inf, '-', color=optimal_curve_colors[i], 
+                            linewidth=2.5, label=f'{I:.0e}', zorder=10)
+        
+        # Set log scales
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+        
+        # Set axis limits if provided
+        if xlim:
+            ax.set_xlim(*xlim)
+        else:
+            # Default limits with some margin
+            ax.set_xlim(10**log_tr_min * 0.5, 10**log_tr_max * 2)
+            
+        if ylim:
+            ax.set_ylim(*ylim)
+        else:
+            # Default limits with some margin
+            ax.set_ylim(10**log_inf_min * 0.5, 10**log_inf_max * 2)
+        
+        # Set axis labels and title
+        ax.set_xlabel('Training Compute')
+        ax.set_ylabel('Inference Compute per Task')
+        ax.set_title(f'Optimal Compute Allocation for Different Numbers of Tasks ({policy_id})')
+        
+        # Add legend for inference counts if we plotted them
+        if inference_counts and any(optimal_tr for optimal_tr in optimal_tr):
+            ax.legend(title='Number of Tasks', loc='best')
+        
+        # Manually draw grid lines with increased transparency
+        ax.grid(False)
+        
+        # X-axis major grid lines
+        for decade in range(int(log_tr_min), int(log_tr_max)+1):
+            ax.axvline(x=10**decade, color='black', linestyle='-', linewidth=0.7, alpha=0.3, zorder=0)
+        
+        # Y-axis major grid lines
+        for decade in range(int(log_inf_min), int(log_inf_max)+1):
+            ax.axhline(y=10**decade, color='black', linestyle='-', linewidth=0.7, alpha=0.3, zorder=0)
+        
+        # X-axis minor grid lines
+        for decade in range(int(log_tr_min), int(log_tr_max)+1):
+            for i in [2, 3, 4, 5, 6, 7, 8, 9]:
+                ax.axvline(x=i*10**decade, color='gray', linestyle=':', linewidth=0.7, alpha=0.3, zorder=0)
+        
+        # Y-axis minor grid lines
+        for decade in range(int(log_inf_min), int(log_inf_max)+1):
+            for i in [2, 3, 4, 5, 6, 7, 8, 9]:
+                ax.axhline(y=i*10**decade, color='gray', linestyle=':', linewidth=0.7, alpha=0.3, zorder=0)
+        
+        # Configure axis ticks
+        ax.xaxis.set_major_locator(ticker.LogLocator(base=10))
+        ax.yaxis.set_major_locator(ticker.LogLocator(base=10))
+        ax.xaxis.set_minor_locator(ticker.LogLocator(base=10, subs=[2,3,4,5,6,7,8,9]))
+        ax.yaxis.set_minor_locator(ticker.LogLocator(base=10, subs=[2,3,4,5,6,7,8,9]))
+        ax.xaxis.set_minor_formatter(ticker.NullFormatter())
+        ax.yaxis.set_minor_formatter(ticker.NullFormatter())
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300)
+        
+        return fig
+    
+    def plot_tokens_contour(self, accuracy_df=None, inference_counts=None, figsize=(12, 10), 
+                      save_path=None, xlim=None, ylim=None):
+        """
+        Create a contour plot of accuracy as a function of training cost and inference tokens.
+        
+        Args:
+            accuracy_df (pandas.DataFrame, optional): DataFrame with results
+            inference_counts (list, optional): List of inference counts to plot optimal curves for
+            figsize (tuple, optional): Figure size
+            save_path (str, optional): Path to save the figure
+            xlim (tuple, optional): x-axis limits (min, max)
+            ylim (tuple, optional): y-axis limits (min, max)
+            
+        Returns:
+            matplotlib.figure.Figure: The generated figure
+        """
+        # Check if we have data
+        if accuracy_df is None:
+            raise ValueError("No data provided. Please provide accuracy_df.")
+        
+        # Filter by policy
+        policy_id = self.policy_type.value
+        df = accuracy_df[accuracy_df['Policy'] == policy_id].copy()
+        
+        # No data for this policy
+        if len(df) == 0:
+            raise ValueError(f"No data found for policy {policy_id}")
+        
+        # Create the figure and axis
+        fig, ax = plt.subplots(figsize=figsize)
+        
+        # Extract data from dataframe
+        C_tr_values = df['C_tr'].values
+        tokens_values = df['Tokens'].values
+        accuracy_values = df['Accuracy'].values
+        
+        # Create a regular grid for interpolation in log space
+        log_tr_min, log_tr_max = np.log10(C_tr_values.min()), np.log10(C_tr_values.max())
+        log_tokens_min, log_tokens_max = np.log10(tokens_values.min()), np.log10(tokens_values.max())
+        
+        grid_size = 100
+        log_tr_grid = np.linspace(log_tr_min, log_tr_max, grid_size)
+        log_tokens_grid = np.linspace(log_tokens_min, log_tokens_max, grid_size)
+        log_tr_mesh, log_tokens_mesh = np.meshgrid(log_tr_grid, log_tokens_grid)
+        
+        # Points need to be in log space for better interpolation
+        log_points = np.column_stack((np.log10(C_tr_values), np.log10(tokens_values)))
+        
+        # Interpolate accuracy values onto the log grid
+        grid_accuracy = griddata(log_points, accuracy_values, (log_tr_mesh, log_tokens_mesh), method='linear')
+        
+        # Convert mesh back to linear scale for plotting
+        tr_mesh = 10**log_tr_mesh
+        tokens_mesh = 10**log_tokens_mesh
+        
+        # Create contour levels excluding values above 0.99
+        min_acc = max(0, np.nanmin(accuracy_values))
+        max_acc = min(0.99, np.nanmax(accuracy_values))  # Cap at 0.99
+        levels = np.linspace(min_acc, max_acc, 10)
+        
+        # Define colormap for consistency
+        cmap = plt.cm.viridis
+        
+        # Create colored contour lines with increased transparency
+        contour_lines = ax.contour(tr_mesh, tokens_mesh, grid_accuracy, levels=levels, 
+                                cmap=cmap, linewidths=1.0, alpha=0.7)
+        
+        # Add scatter points with increased transparency
+        scatter = ax.scatter(C_tr_values, tokens_values, c=accuracy_values, cmap=cmap,
+                            edgecolor='k', s=15, alpha=0.7, zorder=5)
+        
+        # Add colorbar
+        cbar = plt.colorbar(scatter)
+        cbar.set_label('Expected Accuracy')
+        cbar.ax.set_yticks(levels)
+        cbar.ax.set_yticklabels([f'{level:.2f}' for level in levels])
+        
+        # Set log scales
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+        
+        # Set axis limits if provided
+        if xlim:
+            ax.set_xlim(*xlim)
+        else:
+            # Default limits with some margin
+            ax.set_xlim(10**log_tr_min * 0.5, 10**log_tr_max * 2)
+            
+        if ylim:
+            ax.set_ylim(*ylim)
+        else:
+            # Default limits with some margin
+            ax.set_ylim(10**log_tokens_min * 0.5, 10**log_tokens_max * 2)
+        
+        # Set axis labels and title
+        ax.set_xlabel('Training Compute')
+        ax.set_ylabel('Inference Tokens per Task')
+        ax.set_title(f'Accuracy as a Function of Training Compute and Inference Tokens ({policy_id})')
+        
+        # Manually draw grid lines with increased transparency
+        ax.grid(False)
+        
+        # X-axis major grid lines
+        for decade in range(int(log_tr_min), int(log_tr_max)+1):
+            ax.axvline(x=10**decade, color='black', linestyle='-', linewidth=0.7, alpha=0.3, zorder=0)
+        
+        # Y-axis major grid lines
+        for decade in range(int(log_tokens_min), int(log_tokens_max)+1):
+            ax.axhline(y=10**decade, color='black', linestyle='-', linewidth=0.7, alpha=0.3, zorder=0)
+        
+        # X-axis minor grid lines
+        for decade in range(int(log_tr_min), int(log_tr_max)+1):
+            for i in [2, 3, 4, 5, 6, 7, 8, 9]:
+                ax.axvline(x=i*10**decade, color='gray', linestyle=':', linewidth=0.7, alpha=0.3, zorder=0)
+        
+        # Y-axis minor grid lines
+        for decade in range(int(log_tokens_min), int(log_tokens_max)+1):
+            for i in [2, 3, 4, 5, 6, 7, 8, 9]:
+                ax.axhline(y=i*10**decade, color='gray', linestyle=':', linewidth=0.7, alpha=0.3, zorder=0)
+        
+        # Configure axis ticks
+        ax.xaxis.set_major_locator(ticker.LogLocator(base=10))
+        ax.yaxis.set_major_locator(ticker.LogLocator(base=10))
+        ax.xaxis.set_minor_locator(ticker.LogLocator(base=10, subs=[2,3,4,5,6,7,8,9]))
+        ax.yaxis.set_minor_locator(ticker.LogLocator(base=10, subs=[2,3,4,5,6,7,8,9]))
+        ax.xaxis.set_minor_formatter(ticker.NullFormatter())
+        ax.yaxis.set_minor_formatter(ticker.NullFormatter())
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300)
+        
+        return fig
+
+
+class BestOfNModel(ModelFramework):
+    """
+    Extension for Best of N policy.
+    """
+    
+    def __init__(self, n_samples=3, **kwargs):
+        """
+        Initialize with custom parameters for Best of N.
+        
+        Args:
+            n_samples (int): Number of samples to take
+            **kwargs: Passed to parent class
+        """
+        kwargs['policy_type'] = InferencePolicy.BEST_OF_N
+        kwargs['policy_params'] = kwargs.get('policy_params', {})
+        kwargs['policy_params']['n_samples'] = n_samples
+        super().__init__(**kwargs)
+    
+    def compute_inference_cost_best_of_N(self, R, N_star):
+        """
+        Compute the inference cost for Best of N.
+        
+        Args:
+            R (float): R parameter
+            N_star (float): N* value
+            
+        Returns:
+            float: Inference cost
+        """
+        # Get n_samples from policy_params
+        n_samples = self.policy_params.get('n_samples', 3)
+        
+        # For Best of N, the total inference cost is the base cost multiplied by n_samples
+        # Each sample gets an equal portion of the total steps budget
+        base_cost = super().compute_inference_cost_COT(R, N_star / n_samples)
+        
+        return n_samples * base_cost
+    
+    def compute_accuracy_best_of_N(self, gamma_l_star, m_l_star, r_l_star, N_star):
+        """
+        Custom implementation for Best of N accuracy.
+        
+        Args:
+            gamma_l_star (float): gamma_l* value
+            m_l_star (float): m_l* value
+            r_l_star (float): r_l* value
+            N_star (float): N* value
+            
+        Returns:
+            float: Accuracy
+        """
+        # Get n_samples from policy_params
+        n_samples = self.policy_params.get('n_samples', 3)
+        
+        # Base accuracy with budget divided equally among samples
+        base_accuracy = super().compute_accuracy_COT(gamma_l_star, m_l_star, r_l_star, N_star / n_samples)
+        
+        # Best-of-N accuracy: probability that at least one of N samples is correct
+        # P(at least one correct) = 1 - P(all incorrect) = 1 - (1-p)^N
+        best_of_n_accuracy = 1 - (1 - base_accuracy) ** n_samples
+        
+        return best_of_n_accuracy
+    
+    def evaluate_allocation_best_of_N(self, C_tr, C_inf, l, m, p_values=None, gamma_values=None):
+        """
+        Evaluate allocation with Best of N for  l and m.
+        
+        Args:
+            C_tr (float): Training cost
+            C_inf (float): Inference cost
+            l (int): Skill level
+            m (int): Difficulty parameter
+            p_values (list, optional): Pre-computed p values
+            gamma_values (list, optional): Pre-computed gamma values
+            
+        Returns:
+            float: Accuracy
+        """
+        # Ensure p_values and gamma_values are available
+        if p_values is None or gamma_values is None:
+            p_values, gamma_values = self.train(C_tr)
+        
+        # Get n_samples from policy_params
+        n_samples = self.policy_params.get('n_samples', 3)
+        
+        # Calculate R from C_tr
+        R = np.sqrt(C_tr / (6 * self.kappa * self.zeta**2))
+
+        # Compute steps from C_inf, divided by n_samples since each sample gets an equal portion
+        steps_per_sample = C_inf / (2 * self.zeta * R * self.omega * n_samples)
+        
+        # Find best l_star for this allocation
+        best_accuracy = 0
+        best_params = {}
+        
+        # Find if any p_values is 1 and if so store index
+        p_is_1_index = np.where(np.array(p_values) == 1)[0]
+        l_min = 1 if len(p_is_1_index) == 0 else p_is_1_index[-1]
+
+        # Try different l_star values
+        for l_prime in range(l_min, self.L_max + 1):
+            p_l_prime = p_values[l_prime]
+            gamma_l_prime = gamma_values[l_prime]
+            m_l_prime = self.compute_m_l_prime(l, l_prime, m)
+            M_l_prime = self.compute_M_l_prime(m_l_prime)
+            p_eff = p_l_prime * (self.rho / M_l_prime + 1-self.rho)
+            r_l_prime = p_eff * self.q(p_l_prime)
+            
+            # Calculate base accuracy for a single sample
+            base_accuracy = super().compute_accuracy_COT(gamma_l_prime, m_l_prime, r_l_prime, steps_per_sample)
+            
+            # Calculate Best-of-N accuracy
+            accuracy = 1 - (1 - base_accuracy) ** n_samples
+            
+            if accuracy > best_accuracy:
+                best_accuracy = accuracy
+                best_params = {
+                    'l_star': l_prime,
+                    'm_l_star': m_l_prime,
+                    'r_l_star': r_l_prime,
+                    'gamma_l_star': gamma_l_prime
+                }
+
+            if p_l_prime == 0:
+                break
+        
+        # Store optimal parameters for later use
+        self._optimal_params = best_params
+        
+        return best_accuracy
+
+
+class MarkovTreeSearchModel(ModelFramework):
+    """
+    Extension for Markov Tree Search policy.
+    """
+    
+    def __init__(self, branching_factor=3, **kwargs):
+        """
+        Initialize with custom parameters for Markov Tree Search.
+        
+        Args:
+            branching_factor (int): Branching factor of the search tree
+            **kwargs: Passed to parent class
+        """
+        kwargs['policy_type'] = InferencePolicy.MARKOV_TREE_SEARCH
+        kwargs['policy_params'] = kwargs.get('policy_params', {})
+        kwargs['policy_params']['branching_factor'] = branching_factor
+        super().__init__(**kwargs)
+    
+    def compute_expected_steps_variable_cot(self, gamma_l_star, m_l_star, r_l_star, K_max):
+        """
+        Compute the expected number of steps needed for variable Chain of Thought.
+        Used as a building block for MCTS calculations.
+        
+        Args:
+            gamma_l_star (float): gamma_l* value
+            m_l_star (float): m_l* value
+            r_l_star (float): r_l* value
+            K_max (float): Maximum number of steps
+            
+        Returns:
+            float: Expected number of steps
+        """
+        # Initialize
+        expected_steps = 0
+        m = int(np.ceil(m_l_star))  # Ensure m is an integer
+        r = r_l_star
+        gamma = gamma_l_star
+        
+        # Calculate using the summation formula
+        for k in range(m, int(np.ceil(K_max)) + 1):
+            # Calculate beta incomplete for k-m+1 and k-m
+            beta_k_plus_1 = betainc(m, k-m+1, r)
+            beta_k = betainc(m, k-m, r) if k > m else 0
+            
+            # Add to expected steps
+            expected_steps += k * (gamma**m * beta_k_plus_1 - gamma**m * beta_k)
+        
+        # Add the final term for K_max
+        expected_steps += K_max * (1 - gamma**m * betainc(m, K_max-m+1, r))
+        
+        return expected_steps
+    
+    def compute_inference_cost_markov_tree_search(self, R, N_star):
+        """
+        Compute the inference cost for Markov Tree Search.
+        
+        Args:
+            R (float): R parameter
+            N_star (float): N* value
+            
+        Returns:
+            float: Inference cost
+        """
+        # Get parameters from policy_params
+        branching_factor = self.policy_params.get('branching_factor', 3)
+        
+        # Try to get optimal parameters from instance
+        if hasattr(self, '_optimal_params') and self._optimal_params:
+            gamma_l_star = self._optimal_params.get('gamma_l_star')
+            m_l_star = self._optimal_params.get('m_l_star')
+            r_l_star = self._optimal_params.get('r_l_star')
+            
+            if gamma_l_star and m_l_star and r_l_star:
+                # Improved r for MCTS using the formula r_MCTS = 1-(1-r_CoT)^b
+                r_mcts = 1 - (1 - r_l_star) ** branching_factor
+                
+                # Effective number of steps for MCTS (divide by branching factor)
+                K_max = N_star / branching_factor
+                
+                # Compute expected steps for MCTS
+                expected_steps = self.compute_expected_steps_variable_cot(
+                    gamma_l_star, m_l_star, r_mcts, K_max)
+                
+                # Multiply by branching factor for total cost
+                total_expected_steps = expected_steps * branching_factor
+                
+                return 2 * self.zeta * R * self.omega * total_expected_steps
+        
+        # Fallback to basic formula with adjustment for branching factor
+        nodes_per_step = branching_factor
+        return 2 * self.zeta * R * self.omega * N_star * nodes_per_step
+    
+    def compute_accuracy_markov_tree_search(self, gamma_l_star, m_l_star, r_l_star, N_star):
+        """
+        Custom implementation for Markov Tree Search accuracy.
+        
+        Args:
+            gamma_l_star (float): gamma_l* value
+            m_l_star (float): m_l* value
+            r_l_star (float): r_l* value
+            N_star (float): N* value
+            
+        Returns:
+            float: Accuracy
+        """
+        # Get parameters from policy_params
+        branching_factor = self.policy_params.get('branching_factor', 3)
+        
+        # Improved r for MCTS using the formula r_MCTS = 1-(1-r_CoT)^b
+        r_mcts = 1 - (1 - r_l_star) ** branching_factor
+        
+        # Calculate the effective N per node
+        # Each step in MCTS involves evaluating branching_factor nodes
+        effective_steps = N_star / branching_factor
+        
+        # Use the MTS accuracy formula based on the incomplete beta function
+        mts_accuracy = gamma_l_star**m_l_star * betainc(
+            m_l_star, int(np.floor(effective_steps))-m_l_star+1, r_mcts)
+        
+        return mts_accuracy
+    
+    def evaluate_allocation_markov_tree_search(self, C_tr, C_inf, l, m, p_values=None, gamma_values=None):
+        """
+        Evaluate allocation with Markov Tree Search for  l and m.
+        
+        Args:
+            C_tr (float): Training cost
+            C_inf (float): Inference cost
+            l (int): Skill level
+            m (int): Difficulty parameter
+            p_values (list, optional): Pre-computed p values
+            gamma_values (list, optional): Pre-computed gamma values
+            
+        Returns:
+            float: Accuracy
+        """
+        # Ensure p_values and gamma_values are available
+        if p_values is None or gamma_values is None:
+            p_values, gamma_values = self.train(C_tr)
+        
+        # Get parameters from policy_params
+        branching_factor = self.policy_params.get('branching_factor', 3)
+        
+        # Calculate R from C_tr
+        R = np.sqrt(C_tr / (6 * self.kappa * self.zeta**2))
+
+        # Compute total number of node evaluations from C_inf
+        total_nodes = C_inf / (2 * self.zeta * R * self.omega)
+        
+        # Effective steps are total nodes divided by branching factor
+        effective_steps = total_nodes / branching_factor
+        
+        # Find best l_star for this allocation
+        best_accuracy = 0
+        best_params = {}
+        
+        # Find if any p_values is 1 and if so store index
+        p_is_1_index = np.where(np.array(p_values) == 1)[0]
+        l_min = 1 if len(p_is_1_index) == 0 else p_is_1_index[-1]
+
+        # Try different l_star values
+        for l_prime in range(l_min, self.L_max + 1):
+            p_l_prime = p_values[l_prime]
+            gamma_l_prime = gamma_values[l_prime]
+            m_l_prime = self.compute_m_l_prime(l, l_prime, m)
+            M_l_prime = self.compute_M_l_prime(m_l_prime)
+            p_eff = p_l_prime * (self.rho / M_l_prime + 1-self.rho)
+            r_l_prime = p_eff * self.q(p_l_prime)
+            
+            # Improved r for MCTS
+            r_mcts = 1 - (1 - r_l_prime) ** branching_factor
+            
+            # Calculate accuracy using MCTS approach
+            accuracy = gamma_l_prime**m_l_prime * betainc(
+                m_l_prime, int(np.floor(effective_steps))-m_l_prime+1, r_mcts)
+            
+            if accuracy > best_accuracy:
+                best_accuracy = accuracy
+                best_params = {
+                    'l_star': l_prime,
+                    'm_l_star': m_l_prime,
+                    'r_l_star': r_l_prime,
+                    'gamma_l_star': gamma_l_prime
+                }
+
+            if p_l_prime == 0:
+                break
+        
+        # Store optimal parameters for later use
+        self._optimal_params = best_params
+        
+        return best_accuracy
+
+
+class ConsensusModel(ModelFramework):
+    """
+    Extension for Consensus Voting policy.
+    """
+    
+    def __init__(self, consensus_count=5, **kwargs):
+        """
+        Initialize with custom parameters for Consensus Voting.
+        
+        Args:
+            consensus_count (int): Number of trials for consensus
+            **kwargs: Passed to parent class
+        """
+        # Create a new enum value for Consensus
+        # (assuming InferencePolicy is an Enum that can be extended)
+        if not hasattr(InferencePolicy, 'CONSENSUS'):
+            InferencePolicy.CONSENSUS = "consensus"
+            
+        kwargs['policy_type'] = InferencePolicy.CONSENSUS
+        kwargs['policy_params'] = kwargs.get('policy_params', {})
+        kwargs['policy_params']['consensus_count'] = consensus_count
+        super().__init__(**kwargs)
+    
+    def compute_accuracy_consensus(self, gamma_l_star, m_l_star, r_l_star, N_star):
+        """
+        Compute accuracy for Consensus Voting.
+        
+        Args:
+            gamma_l_star (float): gamma_l* value
+            m_l_star (float): m_l* value
+            r_l_star (float): r_l* value
+            N_star (float): N* value
+            
+        Returns:
+            float: Accuracy
+        """
+        # Get consensus_count from policy_params
+        N_con = self.policy_params.get('consensus_count', 5)
+        
+        # Base accuracy with budget divided equally
+        steps_per_trial = N_star / N_con
+        
+        # Base policy success probability
+        psi_0 = gamma_l_star**m_l_star * betainc(m_l_star, int(np.floor(steps_per_trial))-m_l_star+1, r_l_star)
+        
+        # Assuming binary consensus (success vs. failure)
+        # Use regularized incomplete beta function to compute probability of majority success
+        maj_threshold = np.ceil((N_con + 1) / 2)
+        consensus_acc = betainc(maj_threshold, N_con-maj_threshold+1, psi_0)
+        
+        return consensus_acc
+    
+    def compute_inference_cost_consensus(self, R, N_star):
+        """
+        Compute inference cost for Consensus Voting.
+        
+        Args:
+            R (float): R parameter
+            N_star (float): N* value
+            
+        Returns:
+            float: Inference cost
+        """
+        # Get consensus_count from policy_params
+        N_con = self.policy_params.get('consensus_count', 5)
+        
+        # Base CoT cost per trial
+        base_cost = super().compute_inference_cost_COT(R, N_star / N_con)
+        
+        # Total cost is N_con times the cost per trial
+        return N_con * base_cost
+    
+    def evaluate_allocation_consensus(self, C_tr, C_inf, l, m, p_values=None, gamma_values=None):
+        """
+        Evaluate allocation with Consensus Voting for  l and m.
+        
+        Args:
+            C_tr (float): Training cost
+            C_inf (float): Inference cost
+            l (int): Skill level
+            m (int): Difficulty parameter
+            p_values (list, optional): Pre-computed p values
+            gamma_values (list, optional): Pre-computed gamma values
+            
+        Returns:
+            float: Accuracy
+        """
+        # Ensure p_values and gamma_values are available
+        if p_values is None or gamma_values is None:
+            p_values, gamma_values = self.train(C_tr)
+        
+        # Get consensus_count from policy_params
+        N_con = self.policy_params.get('consensus_count', 5)
+        
+        # Calculate R from C_tr
+        R = np.sqrt(C_tr / (6 * self.kappa * self.zeta**2))
+
+        # Compute steps from C_inf, divided by N_con
+        steps_per_trial = C_inf / (2 * self.zeta * R * self.omega * N_con)
+        
+        # Find best l_star for this allocation
+        best_accuracy = 0
+        best_params = {}
+        
+        # Find if any p_values is 1 and if so store index
+        p_is_1_index = np.where(np.array(p_values) == 1)[0]
+        l_min = 1 if len(p_is_1_index) == 0 else p_is_1_index[-1]
+
+        # Try different l_star values
+        for l_prime in range(l_min, self.L_max + 1):
+            p_l_prime = p_values[l_prime]
+            gamma_l_prime = gamma_values[l_prime]
+            m_l_prime = self.compute_m_l_prime(l, l_prime, m)
+            M_l_prime = self.compute_M_l_prime(m_l_prime)
+            p_eff = p_l_prime * (self.rho / M_l_prime + 1-self.rho)
+            r_l_prime = p_eff * self.q(p_l_prime)
+            
+            # Base policy success probability
+            psi_0 = gamma_l_prime**m_l_prime * betainc(
+                m_l_prime, int(np.floor(steps_per_trial))-m_l_prime+1, r_l_prime)
+            
+            # Consensus accuracy calculation
+            maj_threshold = np.ceil((N_con + 1) / 2)
+            accuracy = betainc(maj_threshold, N_con-maj_threshold+1, psi_0)
+            
+            if accuracy > best_accuracy:
+                best_accuracy = accuracy
+                best_params = {
+                    'l_star': l_prime,
+                    'm_l_star': m_l_prime,
+                    'r_l_star': r_l_prime,
+                    'gamma_l_star': gamma_l_prime
+                }
+
+            if p_l_prime == 0:
+                break
+        
+        # Store optimal parameters for later use
+        self._optimal_params = best_params
+        
+        return best_accuracy
+
+
+class CustomDistributionModel(ModelFramework):
+    """
+    Extension with a custom distribution function.
+    """
+    
+    def __init__(self, distribution_func=None, **kwargs):
+        """
+        Initialize with a custom distribution function.
+        
+        Args:
+            distribution_func (callable, optional): Custom phi distribution function
+            **kwargs: Passed to parent class
+        """
+        super().__init__(**kwargs)
+        self._distribution_func = distribution_func
+    
+    def phi(self, l, m):
+        """
+        Use custom distribution function if provided.
+        
+        Args:
+            l (int): Skill level
+            m (int): Difficulty parameter
+            
+        Returns:
+            float: Probability
+        """
+        if self._distribution_func:
+            return self._distribution_func(l, m)
+        else:
+            return super().phi(l, m)
+
+
+class CustomEtaSigmaModel(ModelFramework):
+    """
+    Extension with custom eta_l and sigma_l functions.
+    """
+    
+    def __init__(self, eta_func=None, sigma_func=None, **kwargs):
+        """
+        Initialize with custom eta_l and sigma_l functions.
+        
+        Args:
+            eta_func (callable, optional): Custom eta_l function
+            sigma_func (callable, optional): Custom sigma_l function
+            **kwargs: Passed to parent class
+        """
+        super().__init__(**kwargs)
+        self._eta_func = eta_func
+        self._sigma_func = sigma_func
+    
+    def eta_l(self, l):
+        """
+        Use custom eta_l function if provided.
+        
+        Args:
+            l (int): Skill level
+            
+        Returns:
+            float: eta_l value
+        """
+        if self._eta_func:
+            return self._eta_func(l)
+        else:
+            return super().eta_l(l)
+    
+    def sigma_l(self, l):
+        """
+        Use custom sigma_l function if provided.
+        
+        Args:
+            l (int): Skill level
+            
+        Returns:
+            float: sigma_l value
+        """
+        if self._sigma_func:
+            return self._sigma_func(l)
+        else:
+            return super().sigma_l(l)
+
+
+def run_example():
+    """
+    Example demonstrating how to use the framework with various model types.
+    Tests each inference policy with appropriate budget scaling.
+    """
+    # Define constants
+    constants = {
+        'L_min': 1,
+        'L_max': 100,
+        'm_min': 2,  # Minimum difficulty level
+        'm_max': 50,  # Maximum difficulty level
+        'S_l': 1e3,
+        'd_t': 6,
+        'zeta': 2.5e3,
+        'tau': 1e4,
+        'omega': 25,
+        'kappa': 20,
+        'beta': 2,
+        'rho': 1
+    }
+    
+    # Define base ranges for grid evaluation
+    base_C_tr_values = np.logspace(18, 25, 8)  
+    base_C_inf_values = np.logspace(9, 20, 8)  
+    
+    # Initialize results dataframe
+    all_results_df = pd.DataFrame()
+    
+    # 1. TEST BASELINE COT MODEL
+    print("Evaluating baseline COT model...")
+    cot_model = ModelFramework(constants=constants, policy_type=InferencePolicy.COT)
+    
+    # Evaluate with baseline budget
+    cot_df = cot_model.evaluate_grid(
+        base_C_tr_values, base_C_inf_values, 
+        output_file="accuracy_results_cot.csv",
+        replace=True
+    )
+    
+    # Add to combined results
+    all_results_df = pd.concat([all_results_df, cot_df], ignore_index=True)
+    
+    # Plot results
+    try:
+        plot_model_results(cot_model, cot_df, "cot")
+    except Exception as e:
+        print(f"Error plotting for COT model: {e}")
+    
+    # 2. TEST MCTS MODEL WITH 3X BUDGET
+    print("Evaluating MCTS model with 3x inference budget...")
+    branching_factor = 3
+    mcts_model = MarkovTreeSearchModel(
+        branching_factor=branching_factor, 
+        constants=constants
+    )
+    
+    # Scale inference budget by branching factor
+    mcts_C_inf_values = base_C_inf_values * branching_factor
+    
+    # Evaluate with scaled budget
+    mcts_df = mcts_model.evaluate_grid(
+        base_C_tr_values, mcts_C_inf_values, 
+        output_file="accuracy_results_mcts.csv",
+        replace=True
+    )
+    
+    # Add to combined results
+    all_results_df = pd.concat([all_results_df, mcts_df], ignore_index=True)
+    
+    # Plot results
+    try:
+        plot_model_results(mcts_model, mcts_df, "mcts")
+    except Exception as e:
+        print(f"Error plotting for MCTS model: {e}")
+    
+    # 3. TEST BEST-OF-N MODEL WITH Nx BUDGET
+    print("Evaluating Best-of-N model with scaled inference budget...")
+    n_samples = 5
+    bon_model = BestOfNModel(n_samples=n_samples, constants=constants)
+    
+    # Scale inference budget by n_samples
+    bon_C_inf_values = base_C_inf_values * n_samples
+    
+    # Evaluate with scaled budget
+    bon_df = bon_model.evaluate_grid(
+        base_C_tr_values, bon_C_inf_values, 
+        output_file="accuracy_results_best_of_n.csv",
+        replace=True
+    )
+    
+    # Add to combined results
+    all_results_df = pd.concat([all_results_df, bon_df], ignore_index=True)
+    
+    # Plot results
+    try:
+        plot_model_results(bon_model, bon_df, "best_of_n")
+    except Exception as e:
+        print(f"Error plotting for Best-of-N model: {e}")
+    
+    # 4. TEST CONSENSUS MODEL WITH Nx BUDGET
+    if hasattr(InferencePolicy, 'CONSENSUS'):
+        print("Evaluating Consensus model with scaled inference budget...")
+        consensus_count = 5
+        consensus_model = ConsensusModel(consensus_count=consensus_count, constants=constants)
+        
+        # Scale inference budget by consensus_count
+        consensus_C_inf_values = base_C_inf_values * consensus_count
+        
+        # Evaluate with scaled budget
+        consensus_df = consensus_model.evaluate_grid(
+            base_C_tr_values, consensus_C_inf_values, 
+            output_file="accuracy_results_consensus.csv",
+            replace=True
+        )
+        
+        # Add to combined results
+        all_results_df = pd.concat([all_results_df, consensus_df], ignore_index=True)
+        
+        # Plot results
+        try:
+            plot_model_results(consensus_model, consensus_df, "consensus")
+        except Exception as e:
+            print(f"Error plotting for Consensus model: {e}")
+    
+    # Save combined results
+    all_results_df.to_csv("all_models_results.csv", index=False)
+    
+    # Create comparison plots
+    try:
+        plot_model_comparisons(all_results_df)
+    except Exception as e:
+        print(f"Error creating comparison plots: {e}")
+    
+    print("Evaluation complete. Results saved.")
+    
+    return all_results_df
+
+def plot_model_results(model, df, model_name):
+    """Helper function to generate all plots for a single model"""
+    # Accuracy vs. Inference Cost
+    fig1 = model.plot_accuracy_vs_C_inf(
+        accuracy_df=df,
+        save_path=f"accuracy_vs_inf_{model_name}.png"
+    )
+    
+    # Accuracy vs. Training Cost
+    fig2 = model.plot_accuracy_vs_C_tr(
+        accuracy_df=df,
+        save_path=f"accuracy_vs_tr_{model_name}.png"
+    )
+    
+    # Contour plot
+    inference_counts = [1, 1e6, 1e9, 1e12]
+    fig3 = model.plot_contour(
+        accuracy_df=df,
+        inference_counts=inference_counts,
+        save_path=f"contour_plot_{model_name}.png"
+    )
+    
+    # Tokens vs. Accuracy
+    fig4 = model.plot_accuracy_vs_tokens(
+        accuracy_df=df,
+        save_path=f"accuracy_vs_tokens_{model_name}.png"
+    )
+    
+    # Tokens vs. Training Cost
+    fig5 = model.plot_tokens_contour(
+        accuracy_df=df,
+        save_path=f"tokens_contour_{model_name}.png"
+    )
+    
+    plt.close('all')  # Close all figures to free memory
+
+def plot_model_comparisons(all_results_df):
+    """Create comparison plots across different models"""
+    # Select a few representative C_tr values
+    C_tr_values = sorted(all_results_df['C_tr'].unique())
+    selected_C_tr = [C_tr_values[1], C_tr_values[4], C_tr_values[-1]]  # Low, mid, high
+    
+    for C_tr in selected_C_tr:
+        # Filter data for this C_tr
+        df_subset = all_results_df[all_results_df['C_tr'] == C_tr].copy()
+        
+        # Accuracy vs. scaled inference (divide by multiplier)
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        for policy in df_subset['Policy'].unique():
+            policy_data = df_subset[df_subset['Policy'] == policy]
+            # Sort by increasing C_inf
+            policy_data = policy_data.sort_values('C_inf')
+            
+            # Determine multiplier based on policy (COT=1, MCTS=3, Best-of-N=5, etc.)
+            multiplier = 1
+            if policy == "markov_tree_search":
+                multiplier = 3
+            elif policy == "best_of_n":
+                multiplier = 5
+            elif policy == "consensus":
+                multiplier = 5
+                
+            # Plot normalized C_inf vs. accuracy
+            ax.plot(policy_data['C_inf'] / multiplier, policy_data['Accuracy'], 
+                   marker='o', label=policy)
+        
+        ax.set_xscale('log')
+        ax.set_xlabel('Normalized Inference Compute (per single inference)')
+        ax.set_ylabel('Accuracy')
+        ax.set_title(f'Accuracy vs. Normalized Inference Compute (C_tr={C_tr:.2e})')
+        ax.legend()
+        ax.grid(True)
+        
+        plt.tight_layout()
+        plt.savefig(f'comparison_accuracy_vs_inf_C_tr_{C_tr:.2e}.png', dpi=300)
+        plt.close()
+        
+        # Accuracy vs. scaled tokens
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        for policy in df_subset['Policy'].unique():
+            policy_data = df_subset[df_subset['Policy'] == policy]
+            # Sort by increasing Tokens
+            policy_data = policy_data.sort_values('Tokens')
+            
+            # Determine multiplier based on policy
+            multiplier = 1
+            if policy == "markov_tree_search":
+                multiplier = 3
+            elif policy == "best_of_n":
+                multiplier = 5
+            elif policy == "consensus":
+                multiplier = 5
+                
+            # Plot normalized Tokens vs. accuracy
+            ax.plot(policy_data['Tokens'] / multiplier, policy_data['Accuracy'], 
+                   marker='o', label=policy)
+        
+        ax.set_xscale('log')
+        ax.set_xlabel('Normalized Inference Tokens (per single inference)')
+        ax.set_ylabel('Accuracy')
+        ax.set_title(f'Accuracy vs. Normalized Inference Tokens (C_tr={C_tr:.2e})')
+        ax.legend()
+        ax.grid(True)
+        
+        plt.tight_layout()
+        plt.savefig(f'comparison_accuracy_vs_tokens_C_tr_{C_tr:.2e}.png', dpi=300)
+        plt.close()
+
+if __name__ == "__main__":
+    run_example()
