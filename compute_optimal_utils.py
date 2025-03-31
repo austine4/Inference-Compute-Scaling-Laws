@@ -26,9 +26,9 @@ class ModelFramework:
     # Default constants
     DEFAULT_CONSTANTS = {
         'L_min': 1,  # Minimum skill level
-        'L_max': 100, # Maximum skill level
+        'L_max': 50, # Maximum skill level
         'm_min': 2, # Minimum number of skills
-        'm_max': 50, # Maximum number of skills
+        'm_max': 25, # Maximum number of skills
         'S_l': 1e3, # Number of skills per level
         'd_t': 6, # Degrees of text pieces (number of skills required to understand a text) is binomially distributed with a fixed mean degree, d_t
         'zeta': 2.5e3, # Parameters per concept
@@ -362,146 +362,6 @@ class ModelFramework:
     # =========================================================================
     # POLICY-SPECIFIC FUNCTIONS
     # =========================================================================
-    
-    def compute_inference_cost(self, R, N_star):
-        """
-        Compute the inference cost based on the current policy.
-        
-        Args:
-            R (float): R parameter
-            N_star (float): N* value
-            
-        Returns:
-            float: Inference cost
-        """
-        if self.policy_type == InferencePolicy.COT:
-            return self.compute_inference_cost_COT(R, N_star)
-        elif self.policy_type == InferencePolicy.BEST_OF_N:
-            return self.compute_inference_cost_best_of_N(R, N_star)
-        elif self.policy_type == InferencePolicy.MARKOV_TREE_SEARCH:
-            return self.compute_inference_cost_markov_tree_search(R, N_star)
-        elif self.policy_type == InferencePolicy.ConsensusModel:
-            return self.compute_inference_cost_consensus(R, N_star)
-        else:
-            raise ValueError(f"Unsupported policy type: {self.policy_type}")
-    
-    def compute_accuracy(self, gamma_l_star, m_l_star, r_l_star, N_star):
-        """
-        Compute the accuracy based on the current policy.
-        
-        Args:
-            gamma_l_star (float): gamma_l* value
-            m_l_star (float): m_l* value
-            r_l_star (float): r_l* value
-            N_star (float): N* value
-            
-        Returns:
-            float: Accuracy
-        """
-        if self.policy_type == InferencePolicy.COT:
-            return self.compute_accuracy_COT(gamma_l_star, m_l_star, r_l_star, N_star)
-        elif self.policy_type == InferencePolicy.BEST_OF_N:
-            return self.compute_accuracy_best_of_N(gamma_l_star, m_l_star, r_l_star, N_star)
-        elif self.policy_type == InferencePolicy.MARKOV_TREE_SEARCH:
-            return self.compute_accuracy_markov_tree_search(gamma_l_star, m_l_star, r_l_star, N_star)
-        elif self.policy_type == InferencePolicy.ConsensusModel:
-            return self.compute_accuracy_consensus(gamma_l_star, m_l_star, r_l_star, N_star)
-        else:
-            raise ValueError(f"Unsupported policy type: {self.policy_type}")
-    
-    
-    def compute_expected_steps_variable_cot(self, gamma_l_star, m_l_star, r_l_star, K_max):
-        """
-        Compute the expected number of steps needed for variable Chain of Thought.
-        Based on the formula:
-        E[K|m,r_CoT,K_max]= sum(k=m to K_max) k * (gamma^m * I_r(m,k-m+1) - gamma^m * I_r(m,k-m))
-                            + K_max * (1 - gamma^m * I_r(m,K_max-m+1))
-        
-        Args:
-            gamma_l_star (float): gamma_l* value
-            m_l_star (float): m_l* value
-            r_l_star (float): r_l* value
-            K_max (float): Maximum number of steps
-            
-        Returns:
-            float: Expected number of steps
-        """
-        # Initialize
-        expected_steps = 0
-        m = int(np.ceil(m_l_star))  # Ensure m is an integer
-        r = r_l_star
-        gamma = gamma_l_star
-        
-        # Calculate using the summation formula
-        for k in range(m, int(np.ceil(K_max)) + 1):
-            # Calculate beta incomplete for k-m+1 and k-m
-            beta_k_plus_1 = betainc(m, k-m+1, r)
-            beta_k = betainc(m, k-m, r) if k > m else 0
-            
-            # Add to expected steps
-            expected_steps += k * (gamma**m * beta_k_plus_1 - gamma**m * beta_k)
-        
-        # Add the final term for K_max
-        expected_steps += K_max * (1 - gamma**m * betainc(m, K_max-m+1, r))
-        
-        return expected_steps   
-
-    def compute_expected_steps_variable_cot_wrapper(self, l, m, p_values, gamma_values, steps):
-        """
-        Wrapper to compute expected steps for variable CoT based on optimal l_star selection.
-        
-        Args:
-            l (int): Skill level
-            m (int): Difficulty parameter
-            p_values (list): List of p values
-            gamma_values (list): List of gamma values
-            steps (float): Maximum steps allowed
-            
-        Returns:
-            tuple: (expected_steps, optimal_params)
-        """
-        # Find best l_star for this allocation
-        best_accuracy = 0
-        best_expected_steps = steps  # Default to maximum
-        
-        # Find if any p_values is 1 and if so store index
-        p_is_1_index = np.where(np.array(p_values) == 1)[0]
-        l_min = 1 if len(p_is_1_index) == 0 else p_is_1_index[-1]
-
-        optimal_params = {}
-        
-        # Try different l_star values
-        for l_prime in range(l_min, self.L_max + 1):
-            p_l_prime = p_values[l_prime]
-            gamma_l_prime = gamma_values[l_prime]
-            m_l_prime = self.compute_m_l_prime(l, l_prime, m)
-            M_l_prime = self.compute_M_l_prime(m_l_prime)
-            p_eff = p_l_prime * (self.rho / M_l_prime + 1-self.rho)
-            r_l_prime = p_eff * self.q(p_l_prime)
-            
-            # Calculate expected steps using the variable CoT formula
-            expected_steps = self.compute_expected_steps_variable_cot(
-                gamma_l_prime, m_l_prime, r_l_prime, steps)
-            
-            # Calculate accuracy
-            accuracy = self.compute_accuracy_COT(gamma_l_prime, m_l_prime, r_l_prime, steps)
-            
-            if accuracy > best_accuracy:
-                best_accuracy = accuracy
-                best_expected_steps = expected_steps
-                optimal_params = {
-                    'l_star': l_prime,
-                    'm_l_star': m_l_prime,
-                    'r_l_star': r_l_prime,
-                    'gamma_l_star': gamma_l_prime,
-                    'accuracy': accuracy
-                }
-
-            if p_l_prime == 0:
-                break
-        
-        return best_expected_steps, optimal_params
-
 
     def evaluate_allocation(self, C_tr, C_inf, l, m, p_values=None, gamma_values=None):
         """
@@ -516,7 +376,7 @@ class ModelFramework:
             gamma_values (list, optional): Pre-computed gamma values
             
         Returns:
-            float: Accuracy
+            tuple: (accuracy, inference_cost)
         """
         # Ensure p_values and gamma_values are available
         if p_values is None or gamma_values is None:
@@ -528,113 +388,51 @@ class ModelFramework:
             return self.evaluate_allocation_best_of_N(C_tr, C_inf, l, m, p_values, gamma_values)
         elif self.policy_type == InferencePolicy.MARKOV_TREE_SEARCH:
             return self.evaluate_allocation_markov_tree_search(C_tr, C_inf, l, m, p_values, gamma_values)
-        elif hasattr(InferencePolicy, 'CONSENSUS') and self.policy_type == InferencePolicy.CONSENSUS:
+        elif self.policy_type == InferencePolicy.CONSENSUS:
             return self.evaluate_allocation_consensus(C_tr, C_inf, l, m, p_values, gamma_values)
         else:
-            raise ValueError(f"Unsupported policy type: {self.policy_type}")    
+            raise ValueError(f"Unsupported policy type: {self.policy_type}")
 
-    def compute_inference_cost_COT(self, R, N_star):
+    def compute_expected_steps_cot(self, gamma_l_star, m_l_star, r_l_star, K_max):
         """
-        Updated to use the variable CoT formula for expected steps.
+        Compute the expected number of steps needed for Chain of Thought.
+        Based on the formula:
+        E[K|m,r_CoT,K_max]= sum(k=m to K_max) k * (gamma^m * I_r(m,k-m+1) - gamma^m * I_r(m,k-m))
+                            + K_max * (1 - gamma^m * I_r(m,K_max-m+1))
         
         Args:
-            R (float): R parameter
-            N_star (float): N* value
+            gamma_l_star (float): gamma value
+            m_l_star (float): m value
+            r_l_star (float): r value
+            K_max (float): Maximum number of steps
             
         Returns:
-            float: Inference cost
+            float: Expected number of steps
         """
-        # Try to get optimal parameters from instance
-        if hasattr(self, '_optimal_params') and self._optimal_params:
-            gamma_l_star = self._optimal_params.get('gamma_l_star')
-            m_l_star = self._optimal_params.get('m_l_star')
-            r_l_star = self._optimal_params.get('r_l_star')
-            
-            if gamma_l_star and m_l_star and r_l_star:
-                # Compute expected steps using the variable CoT formula
-                expected_steps = self.compute_expected_steps_variable_cot(
-                    gamma_l_star, m_l_star, r_l_star, N_star)
-                return 2 * self.zeta * R * self.omega * expected_steps
+        # Initialize
+        expected_steps = 0
+        m = int(np.ceil(m_l_star))  # Ensure m is an integer
+        r = r_l_star
+        gamma = gamma_l_star
         
-        # Fallback to original formula if optimal params not available
-        return 2 * self.zeta * R * self.omega * N_star
+        """
+        # Calculate using the summation formula
+        for k in range(m, int(np.ceil(K_max)) + 1):
+            # Calculate beta incomplete for k-m+1 and k-m
+            beta_k_plus_1 = betainc(m, k-m+1, r)
+            beta_k = betainc(m, k-m, r) if k > m else 0
+            
+            # Add to expected steps
+            expected_steps += k * gamma**m * (beta_k_plus_1 - beta_k)
+        
+        # Add the final term for K_max
+        expected_steps += K_max * (1 - gamma**m * betainc(m, K_max-m+1, r))
+        """
 
-    def compute_inference_cost_best_of_N(self, R, N_star):
-        """
-        Compute the inference cost for Best of N.
-        
-        Args:
-            R (float): R parameter
-            N_star (float): N* value
-            
-        Returns:
-            float: Inference cost
-        """
-        # Get n_samples from policy_params
-        n_samples = self.policy_params.get('n_samples', 3)
-        
-        # For Best of N, the total inference cost is the base cost multiplied by n_samples
-        # Each sample gets an equal portion of the total steps budget
-        base_cost = self.compute_inference_cost_COT(R, N_star / n_samples)
-        
-        return n_samples * base_cost
+        # Do to massive K_max, we approximate:
+        expected_steps = min(K_max, m_l_star/r_l_star)
 
-    def compute_inference_cost_markov_tree_search(self, R, N_star):
-        """
-        Compute the inference cost for Markov Tree Search.
-        
-        Args:
-            R (float): R parameter
-            N_star (float): N* value
-            
-        Returns:
-            float: Inference cost
-        """
-        # Get parameters from policy_params
-        branching_factor = self.policy_params.get('branching_factor', 3)
-        
-        # Try to get optimal parameters from instance
-        if hasattr(self, '_optimal_params') and self._optimal_params:
-            gamma_l_star = self._optimal_params.get('gamma_l_star')
-            m_l_star = self._optimal_params.get('m_l_star')
-            r_l_star = self._optimal_params.get('r_l_star')
-            
-            if gamma_l_star and m_l_star and r_l_star:
-                # Improved r for MCTS using the formula r_MCTS = 1-(1-r_CoT)^b
-                r_mcts = 1 - (1 - r_l_star) ** branching_factor
-                
-                # Effective number of steps for MCTS
-                K_max = N_star / branching_factor
-                
-                # Compute expected steps for MCTS
-                expected_steps = self.compute_expected_steps_variable_cot(
-                    gamma_l_star, m_l_star, r_mcts, K_max)
-                
-                # Scale by branching factor
-                expected_steps *= branching_factor
-                
-                return 2 * self.zeta * R * self.omega * expected_steps
-        
-        # Fallback to original CoT formula with adjustment for branching factor
-        base_cost = self.compute_inference_cost_COT(R, N_star / branching_factor)
-        return base_cost * branching_factor
-    
-    def compute_accuracy_consensus(self, gamma_l_star, m_l_star, r_l_star, N_star):
-        """
-        Compute the accuracy for Consensus Model.
-        
-        Args:
-            gamma_l_star (float): gamma_l* value
-            m_l_star (float): m_l* value
-            r_l_star (float): r_l* value
-            N_star (float): N* value
-            
-        Returns:
-            float: Accuracy
-        """
-        # Consensus model accuracy is similar to CoT but with a consensus mechanism
-        # For simplicity, we can use the same formula as CoT for now
-        return (gamma_l_star ** m_l_star) * betainc(m_l_star, N_star - m_l_star + 1, r_l_star)
+        return expected_steps
 
     def compute_accuracy_COT(self, gamma_l_star, m_l_star, r_l_star, N_star):
         """
@@ -649,75 +447,6 @@ class ModelFramework:
         Returns:
             float: Accuracy
         """
-        return (gamma_l_star ** m_l_star) * betainc(m_l_star, N_star - m_l_star + 1, r_l_star)
-
-    def compute_accuracy_best_of_N(self, gamma_l_star, m_l_star, r_l_star, N_star):
-        """
-        Compute the accuracy for Best of N.
-        
-        Args:
-            gamma_l_star (float): gamma_l* value
-            m_l_star (float): m_l* value
-            r_l_star (float): r_l* value
-            N_star (float): N* value
-            
-        Returns:
-            float: Accuracy
-        """
-        # Get n_samples from policy_params
-        n_samples = self.policy_params.get('n_samples', 3)
-        
-        # Base accuracy with budget divided equally among samples
-        base_accuracy = self.compute_accuracy_COT(gamma_l_star, m_l_star, r_l_star, N_star / n_samples)
-        
-        # Best-of-N accuracy: probability that at least one of N samples is correct
-        # P(at least one correct) = 1 - P(all incorrect) = 1 - (1-p)^N
-        best_of_n_accuracy = 1 - (1 - base_accuracy) ** n_samples
-        
-        return best_of_n_accuracy
-
-    def compute_accuracy_markov_tree_search(self, gamma_l_star, m_l_star, r_l_star, N_star):
-        """
-        Compute the accuracy for Markov Tree Search.
-        
-        Args:
-            gamma_l_star (float): gamma_l* value
-            m_l_star (float): m_l* value
-            r_l_star (float): r_l* value
-            N_star (float): N* value
-            
-        Returns:
-            float: Accuracy
-        """
-        # Get parameters from policy_params
-        branching_factor = self.policy_params.get('branching_factor', 3)
-        
-        # Improved r for MCTS using the formula r_MCTS = 1-(1-r_CoT)^b
-        r_mcts = 1 - (1 - r_l_star) ** branching_factor
-        
-        # Effective number of steps for MCTS (each step now evaluates b nodes)
-        effective_N_star = N_star / branching_factor
-        
-        # Base accuracy using improved r_mcts and reduced effective steps
-        mcts_accuracy = self.compute_accuracy_COT(gamma_l_star, m_l_star, r_mcts, effective_N_star)
-        
-        return mcts_accuracy
-    
-    def compute_accuracy_consensus_model(self, gamma_l_star, m_l_star, r_l_star, N_star):
-        """
-        Compute the accuracy for Consensus Model.
-        
-        Args:
-            gamma_l_star (float): gamma_l* value
-            m_l_star (float): m_l* value
-            r_l_star (float): r_l* value
-            N_star (float): N* value
-            
-        Returns:
-            float: Accuracy
-        """
-        # Consensus model accuracy is similar to CoT but with a consensus mechanism
-        # For simplicity, we can use the same formula as CoT for now
         return (gamma_l_star ** m_l_star) * betainc(m_l_star, N_star - m_l_star + 1, r_l_star)
     
     # =========================================================================
@@ -746,7 +475,6 @@ class ModelFramework:
 
         return p_values, gamma_values
     
-    
     def evaluate_allocation_COT(self, C_tr, C_inf, l, m, p_values=None, gamma_values=None):
         """
         Evaluate allocation for Chain of Thought with fixed l and m.
@@ -760,7 +488,7 @@ class ModelFramework:
             gamma_values (list, optional): Pre-computed gamma values
             
         Returns:
-            float: Accuracy
+            tuple: (accuracy, actual_inference_cost)
         """
         # Ensure p_values and gamma_values are available
         if p_values is None or gamma_values is None:
@@ -770,45 +498,42 @@ class ModelFramework:
         R = np.sqrt(C_tr / (6 * self.kappa * self.zeta**2))
 
         # Compute steps from C_inf
-        steps = C_inf / (2 * self.zeta * R * self.omega)
+        K_max = C_inf / (2 * self.zeta * R * self.omega)
 
         # Find best l_star for this allocation
         best_accuracy = 0
+        cost = 2 * self.zeta * R * self.omega * K_max
         
         # Find if any p_values is 1 and if so store index
         p_is_1_index = np.where(np.array(p_values) == 1)[0]
         l_min = 1 if len(p_is_1_index) == 0 else p_is_1_index[-1]
 
-        optimal_params = {}
         # Try different l_star values
         for l_prime in range(l_min, self.L_max + 1):
             p_l_prime = p_values[l_prime]
             gamma_l_prime = gamma_values[l_prime]
+            
+            # Skip if gamma is 0
+            if gamma_l_prime == 0:
+                break
+                
+            gamma_l_prime = gamma_values[l_prime]
             m_l_prime = self.compute_m_l_prime(l, l_prime, m)
             M_l_prime = self.compute_M_l_prime(m_l_prime)
             p_eff = p_l_prime * (self.rho / M_l_prime + 1-self.rho)
-            r_l_prime = p_eff * self.q(p_l_prime) # Note that q(p) is a function of p
+            r_l_prime = p_eff * self.q(p_l_prime)
             
             # Calculate accuracy
-            accuracy = self.compute_accuracy_COT(gamma_l_prime, m_l_prime, r_l_prime, steps)
+            accuracy = self.compute_accuracy_COT(gamma_l_prime, m_l_prime, r_l_prime, K_max)
             
             if accuracy > best_accuracy:
                 best_accuracy = accuracy
-                optimal_params = {
-                    'l_star': l_prime,
-                    'm_l_star': m_l_prime,
-                    'r_l_star': r_l_prime,
-                    'gamma_l_star': gamma_l_prime
-                }
+                # Calculate expected steps and actual inference cost
+                expected_steps = self.compute_expected_steps_cot(gamma_l_prime, m_l_prime, r_l_prime, K_max)
+                cost = 2 * self.zeta * R * self.omega * expected_steps
 
-            if p_l_prime == 0:
-                break
-        
-        # Store optimal parameters for later use
-        self._optimal_params = optimal_params
+        return best_accuracy, cost
 
-        return best_accuracy
-    
     def evaluate_allocation_best_of_N(self, C_tr, C_inf, l, m, p_values=None, gamma_values=None):
         """
         Evaluate allocation with Best of N for fixed l and m.
@@ -822,12 +547,58 @@ class ModelFramework:
             gamma_values (list, optional): Pre-computed gamma values
             
         Returns:
-            float: Accuracy
+            tuple: (accuracy, actual_inference_cost)
         """
-        # Default implementation same as COT
-        # Override in subclass for custom implementation
-        return self.evaluate_allocation_COT(C_tr, C_inf, l, m, p_values, gamma_values)
-    
+        # Ensure p_values and gamma_values are available
+        if p_values is None or gamma_values is None:
+            p_values, gamma_values = self.train(C_tr)
+        
+        # Get n_samples from policy_params
+        n_samples = self.policy_params.get('n_samples', 3)
+        
+        # Calculate R from C_tr
+        R = np.sqrt(C_tr / (6 * self.kappa * self.zeta**2))
+
+        # Compute steps per sample from C_inf
+        K_max_per_sample = C_inf / (n_samples * 2 * self.zeta * R * self.omega)
+        
+        # Find best l_star for this allocation
+        best_accuracy = 0
+        cost = n_samples * 2 * self.zeta * R * self.omega * K_max_per_sample
+        
+        # Find if any p_values is 1 and if so store index
+        p_is_1_index = np.where(np.array(p_values) == 1)[0]
+        l_min = 1 if len(p_is_1_index) == 0 else p_is_1_index[-1]
+
+        # Try different l_star values
+        for l_prime in range(l_min, self.L_max + 1):
+            p_l_prime = p_values[l_prime]
+            gamma_l_prime = gamma_values[l_prime]
+            
+            # Skip if gamma is 0
+            if gamma_l_prime == 0:
+                break
+                
+            gamma_l_prime = gamma_values[l_prime]
+            m_l_prime = self.compute_m_l_prime(l, l_prime, m)
+            M_l_prime = self.compute_M_l_prime(m_l_prime)
+            p_eff = p_l_prime * (self.rho / M_l_prime + 1-self.rho)
+            r_l_prime = p_eff * self.q(p_l_prime)
+            
+            # Calculate base accuracy for a single sample
+            base_accuracy = self.compute_accuracy_COT(gamma_l_prime, m_l_prime, r_l_prime, K_max_per_sample)
+            
+            # Calculate Best-of-N accuracy
+            accuracy = 1 - (1 - base_accuracy) ** n_samples
+            
+            if accuracy > best_accuracy:
+                best_accuracy = accuracy
+                # Calculate expected steps per sample and total actual inference cost
+                expected_steps_per_sample = self.compute_expected_steps_cot(gamma_l_prime, m_l_prime, r_l_prime, K_max_per_sample)
+                cost = n_samples * 2 * self.zeta * R * self.omega * expected_steps_per_sample
+        
+        return best_accuracy, cost
+
     def evaluate_allocation_markov_tree_search(self, C_tr, C_inf, l, m, p_values=None, gamma_values=None):
         """
         Evaluate allocation with Markov Tree Search for fixed l and m.
@@ -841,22 +612,134 @@ class ModelFramework:
             gamma_values (list, optional): Pre-computed gamma values
             
         Returns:
-            float: Accuracy
+            tuple: (accuracy, actual_inference_cost)
         """
-        # Default implementation same as COT
-        # Override in subclass for custom implementation
-        return self.evaluate_allocation_COT(C_tr, C_inf, l, m, p_values, gamma_values)
+        # Ensure p_values and gamma_values are available
+        if p_values is None or gamma_values is None:
+            p_values, gamma_values = self.train(C_tr)
+        
+        # Get parameters from policy_params
+        branching_factor = self.policy_params.get('branching_factor', 3)
+        
+        # Calculate R from C_tr
+        R = np.sqrt(C_tr / (6 * self.kappa * self.zeta**2))
+
+        # Compute effective steps from C_inf (accounting for branching factor)
+        K_max_effective = C_inf / (branching_factor * 2 * self.zeta * R * self.omega)
+        
+        # Find best l_star for this allocation
+        best_accuracy = 0
+        cost = branching_factor * 2 * self.zeta * R * self.omega * K_max_effective
+        
+        # Find if any p_values is 1 and if so store index
+        p_is_1_index = np.where(np.array(p_values) == 1)[0]
+        l_min = 1 if len(p_is_1_index) == 0 else p_is_1_index[-1]
+
+        # Try different l_star values
+        for l_prime in range(l_min, self.L_max + 1):
+            p_l_prime = p_values[l_prime]
+            gamma_l_prime = gamma_values[l_prime]
+            
+            # Skip if gamma is 0
+            if gamma_l_prime == 0:
+                break
+                
+            gamma_l_prime = gamma_values[l_prime]
+            m_l_prime = self.compute_m_l_prime(l, l_prime, m)
+            M_l_prime = self.compute_M_l_prime(m_l_prime)
+            p_eff = p_l_prime * (self.rho / M_l_prime + 1-self.rho)
+            r_l_prime = p_eff * self.q(p_l_prime)
+            
+            # Improved r for MCTS
+            r_mcts = 1 - (1 - r_l_prime) ** branching_factor
+            
+            # Calculate accuracy using MCTS approach
+            accuracy = self.compute_accuracy_COT(gamma_l_prime, m_l_prime, r_mcts, K_max_effective)
+            
+            if accuracy > best_accuracy:
+                best_accuracy = accuracy
+                # Calculate expected steps and actual inference cost
+                expected_steps = self.compute_expected_steps_cot(gamma_l_prime, m_l_prime, r_mcts, K_max_effective)
+                cost = branching_factor * 2 * self.zeta * R * self.omega * expected_steps
+        
+        return best_accuracy, cost
+
+    def evaluate_allocation_consensus(self, C_tr, C_inf, l, m, p_values=None, gamma_values=None):
+        """
+        Evaluate allocation with Consensus for fixed l and m.
+        
+        Args:
+            C_tr (float): Training cost
+            C_inf (float): Inference cost
+            l (int): Skill level
+            m (int): Difficulty parameter
+            p_values (list, optional): Pre-computed p values
+            gamma_values (list, optional): Pre-computed gamma values
+            
+        Returns:
+            tuple: (accuracy, actual_inference_cost)
+        """
+        # Ensure p_values and gamma_values are available
+        if p_values is None or gamma_values is None:
+            p_values, gamma_values = self.train(C_tr)
+        
+        # Get consensus_count from policy_params
+        N_con = self.policy_params.get('consensus_count', 5)
+        
+        # Calculate R from C_tr
+        R = np.sqrt(C_tr / (6 * self.kappa * self.zeta**2))
+
+        # Compute steps per trial from C_inf
+        K_max_per_trial = C_inf / (N_con * 2 * self.zeta * R * self.omega)
+        
+        # Find best l_star for this allocation
+        best_accuracy = 0
+        cost = N_con * 2 * self.zeta * R * self.omega * K_max_per_trial
+        
+        # Find if any p_values is 1 and if so store index
+        p_is_1_index = np.where(np.array(p_values) == 1)[0]
+        l_min = 1 if len(p_is_1_index) == 0 else p_is_1_index[-1]
+
+        # Try different l_star values
+        for l_prime in range(l_min, self.L_max + 1):
+            p_l_prime = p_values[l_prime]
+            gamma_l_prime = gamma_values[l_prime]
+            
+            # Skip if gamma is 0
+            if gamma_l_prime == 0:
+                break
+                
+            gamma_l_prime = gamma_values[l_prime]
+            m_l_prime = self.compute_m_l_prime(l, l_prime, m)
+            M_l_prime = self.compute_M_l_prime(m_l_prime)
+            p_eff = p_l_prime * (self.rho / M_l_prime + 1-self.rho)
+            r_l_prime = p_eff * self.q(p_l_prime)
+            
+            # Base policy success probability
+            base_accuracy = self.compute_accuracy_COT(gamma_l_prime, m_l_prime, r_l_prime, K_max_per_trial)
+            
+            # Consensus accuracy calculation
+            maj_threshold = np.ceil((N_con + 1) / 2)
+            accuracy = betainc(maj_threshold, N_con-maj_threshold+1, base_accuracy)
+            
+            if accuracy > best_accuracy:
+                best_accuracy = accuracy
+                # Calculate expected steps per trial and total actual inference cost
+                expected_steps_per_trial = self.compute_expected_steps_cot(gamma_l_prime, m_l_prime, r_l_prime, K_max_per_trial)
+                cost = N_con * 2 * self.zeta * R * self.omega * expected_steps_per_trial
+        
+        return best_accuracy, cost
     
     def evaluate_allocation_all(self, C_tr, C_inf):
         """
-        Evaluate accuracy for all possible values of l and m based on the current policy.
+        Evaluate accuracy and cost for all possible values of l and m based on the current policy.
         
         Args:
             C_tr (float): Training cost
             C_inf (float): Inference cost
             
         Returns:
-            float: Expected accuracy
+            tuple: (expected_accuracy, expected_cost)
         """
         if self.policy_type == InferencePolicy.COT:
             return self.evaluate_allocation_all_COT(C_tr, C_inf)
@@ -871,17 +754,18 @@ class ModelFramework:
     
     def evaluate_allocation_all_COT(self, C_tr, C_inf):
         """
-        Evaluate accuracy for all possible values of l and m for COT.
+        Evaluate accuracy and cost for all possible values of l and m for COT.
         
         Args:
             C_tr (float): Training cost
             C_inf (float): Inference cost
             
         Returns:
-            float: Expected accuracy
+            tuple: (expected_accuracy, expected_cost)
         """
-        # Initialize accuracy matrix
+        # Initialize accuracy and cost
         expected_accuracy = 0
+        expected_cost = 0
         
         # Compute p_values and gamma_values
         p_values, gamma_values = self.train(C_tr)
@@ -889,25 +773,32 @@ class ModelFramework:
         # Iterate over all possible values of l and m
         for l in range(self.L_min, self.L_max+1):
             for m in range(self.m_min, self.m_max+1):
-                # Note the corrected parameter order - l and m come before p_values and gamma_values
-                expected_accuracy += self.phi(l,m) * self.evaluate_allocation_COT(C_tr, C_inf, l, m, p_values, gamma_values)
+                # Get probability for this l,m pair
+                prob = self.phi(l, m)
+                
+                # Get accuracy and cost for this l,m pair
+                accuracy, cost = self.evaluate_allocation_COT(C_tr, C_inf, l, m, p_values, gamma_values)
+                
+                # Add weighted accuracy and cost to totals
+                expected_accuracy += prob * accuracy
+                expected_cost += prob * cost
         
-        return expected_accuracy
+        return expected_accuracy, expected_cost
 
-    # Need to fix all the other evaluate_allocation_all_X methods as well
     def evaluate_allocation_all_best_of_N(self, C_tr, C_inf):
         """
-        Evaluate accuracy for all possible values of l and m with Best of N.
+        Evaluate accuracy and cost for all possible values of l and m with Best of N.
         
         Args:
             C_tr (float): Training cost
             C_inf (float): Inference cost
             
         Returns:
-            float: Expected accuracy
+            tuple: (expected_accuracy, expected_cost)
         """
-        # Initialize accuracy matrix
+        # Initialize accuracy and cost
         expected_accuracy = 0
+        expected_cost = 0
         
         # Compute p_values and gamma_values
         p_values, gamma_values = self.train(C_tr)
@@ -915,24 +806,32 @@ class ModelFramework:
         # Iterate over all possible values of l and m
         for l in range(self.L_min, self.L_max+1):
             for m in range(self.m_min, self.m_max+1):
-                # Note the corrected parameter order - l and m come before p_values and gamma_values
-                expected_accuracy += self.phi(l,m) * self.evaluate_allocation_best_of_N(C_tr, C_inf, l, m, p_values, gamma_values)
+                # Get probability for this l,m pair
+                prob = self.phi(l, m)
+                
+                # Get accuracy and cost for this l,m pair
+                accuracy, cost = self.evaluate_allocation_best_of_N(C_tr, C_inf, l, m, p_values, gamma_values)
+                
+                # Add weighted accuracy and cost to totals
+                expected_accuracy += prob * accuracy
+                expected_cost += prob * cost
         
-        return expected_accuracy
+        return expected_accuracy, expected_cost
 
     def evaluate_allocation_all_markov_tree_search(self, C_tr, C_inf):
         """
-        Evaluate accuracy for all possible values of l and m with Markov Tree Search.
+        Evaluate accuracy and cost for all possible values of l and m with Markov Tree Search.
         
         Args:
             C_tr (float): Training cost
             C_inf (float): Inference cost
             
         Returns:
-            float: Expected accuracy
+            tuple: (expected_accuracy, expected_cost)
         """
-        # Initialize accuracy matrix
+        # Initialize accuracy and cost
         expected_accuracy = 0
+        expected_cost = 0
         
         # Compute p_values and gamma_values
         p_values, gamma_values = self.train(C_tr)
@@ -940,24 +839,32 @@ class ModelFramework:
         # Iterate over all possible values of l and m
         for l in range(self.L_min, self.L_max+1):
             for m in range(self.m_min, self.m_max+1):
-                # Note the corrected parameter order - l and m come before p_values and gamma_values
-                expected_accuracy += self.phi(l,m) * self.evaluate_allocation_markov_tree_search(C_tr, C_inf, l, m, p_values, gamma_values)
+                # Get probability for this l,m pair
+                prob = self.phi(l, m)
+                
+                # Get accuracy and cost for this l,m pair
+                accuracy, cost = self.evaluate_allocation_markov_tree_search(C_tr, C_inf, l, m, p_values, gamma_values)
+                
+                # Add weighted accuracy and cost to totals
+                expected_accuracy += prob * accuracy
+                expected_cost += prob * cost
         
-        return expected_accuracy
+        return expected_accuracy, expected_cost
 
     def evaluate_allocation_all_consensus(self, C_tr, C_inf):
         """
-        Evaluate accuracy for all possible values of l and m with Consensus.
+        Evaluate accuracy and cost for all possible values of l and m with Consensus.
         
         Args:
             C_tr (float): Training cost
             C_inf (float): Inference cost
             
         Returns:
-            float: Expected accuracy
+            tuple: (expected_accuracy, expected_cost)
         """
-        # Initialize accuracy matrix
+        # Initialize accuracy and cost
         expected_accuracy = 0
+        expected_cost = 0
         
         # Compute p_values and gamma_values
         p_values, gamma_values = self.train(C_tr)
@@ -965,10 +872,17 @@ class ModelFramework:
         # Iterate over all possible values of l and m
         for l in range(self.L_min, self.L_max+1):
             for m in range(self.m_min, self.m_max+1):
-                # Note the corrected parameter order - l and m come before p_values and gamma_values
-                expected_accuracy += self.phi(l,m) * self.evaluate_allocation_consensus(C_tr, C_inf, l, m, p_values, gamma_values)
+                # Get probability for this l,m pair
+                prob = self.phi(l, m)
+                
+                # Get accuracy and cost for this l,m pair
+                accuracy, cost = self.evaluate_allocation_consensus(C_tr, C_inf, l, m, p_values, gamma_values)
+                
+                # Add weighted accuracy and cost to totals
+                expected_accuracy += prob * accuracy
+                expected_cost += prob * cost
         
-        return expected_accuracy
+        return expected_accuracy, expected_cost
     
     def find_optimal_allocation(self, total_budget, n_steps=10):
         """
@@ -1013,7 +927,7 @@ class ModelFramework:
     
     def evaluate_grid(self, C_tr_values, C_inf_values, output_file=None, replace=False):
         """
-        Evaluate accuracy for all combinations of C_tr and C_inf and store in a DataFrame.
+        Evaluate accuracy and cost for all combinations of C_tr and C_inf and store in a DataFrame.
         
         Args:
             C_tr_values (list): List of training costs to evaluate
@@ -1033,19 +947,22 @@ class ModelFramework:
                 return iterable
             print("Note: Install tqdm package for progress bars")
         
+        # Initialize columns including the new cost metrics
+        columns = ['C_tr', 'C_inf', 'C_inf_allocated', 'Accuracy', 'Policy', 'Params', 'Tokens']
+        
         # Initialize or load accuracy DataFrame
-        if output_file and os.path.exists(output_file):
+        if output_file and os.path.exists(output_file) and not replace:
             try:
                 accuracy_df = pd.read_csv(output_file)
                 # Ensure all required columns exist
-                for col in ['C_tr', 'C_inf', 'Accuracy', 'Policy', 'Params', 'Tokens']:
+                for col in columns:
                     if col not in accuracy_df.columns:
                         accuracy_df[col] = None  # Add the column with None values
             except Exception as e:
                 print(f"Error reading existing file: {e}")
-                accuracy_df = pd.DataFrame(columns=['C_tr', 'C_inf', 'Accuracy', 'Policy', 'Params', 'Tokens'])
+                accuracy_df = pd.DataFrame(columns=columns)
         else:
-            accuracy_df = pd.DataFrame(columns=['C_tr', 'C_inf', 'Accuracy', 'Policy', 'Params', 'Tokens'])
+            accuracy_df = pd.DataFrame(columns=columns)
         
         # Policy identifier
         policy_id = self.policy_type.value
@@ -1064,12 +981,11 @@ class ModelFramework:
             params = np.sqrt(C_tr / (6 * self.kappa * self.zeta**2))
             
             # Use nested progress bar for inference costs
-            for C_inf in tqdm(C_inf_values, desc=f"  Inference costs (C_tr={C_tr:.2e})", 
-                            leave=False, ncols=100):
+            for C_inf in tqdm(C_inf_values, desc=f"  Inference costs (C_tr={C_tr:.2e})", leave=False, ncols=100):
                 # Check if this combination already exists and we're not replacing
-                if not replace and 'Policy' in accuracy_df.columns:
+                if not replace:
                     matching_rows = ((accuracy_df['C_tr'] == C_tr) & 
-                                    (accuracy_df['C_inf'] == C_inf) & 
+                                    (accuracy_df['C_inf_allocated'] == C_inf) & 
                                     (accuracy_df['Policy'] == policy_id))
                     if matching_rows.any():
                         skipped += 1
@@ -1078,20 +994,21 @@ class ModelFramework:
                 # Calculate tokens based on C_inf and params
                 tokens = C_inf / (2 * params * self.omega)
                 
-                # Evaluate accuracy
-                accuracy = self.evaluate_allocation_all(C_tr, C_inf)
+                # Evaluate accuracy and cost
+                accuracy, actual_cost = self.evaluate_allocation_all(C_tr, C_inf)
                 processed += 1
                 
                 # Remove existing row if replacing
-                if replace and 'Policy' in accuracy_df.columns:
+                if replace:
                     accuracy_df = accuracy_df.loc[~((accuracy_df['C_tr'] == C_tr) & 
-                                                (accuracy_df['C_inf'] == C_inf) & 
+                                                (accuracy_df['C_inf_allocated'] == C_inf) & 
                                                 (accuracy_df['Policy'] == policy_id))]
                 
                 # Add result to DataFrame
                 new_row = pd.DataFrame({
                     'C_tr': [C_tr], 
-                    'C_inf': [C_inf], 
+                    'C_inf': [actual_cost],  # This is the expected inference cost calculated from the evaluation
+                    'C_inf_allocated': [C_inf],  # This is the budget allocated to inference
                     'Accuracy': [accuracy],
                     'Policy': [policy_id],
                     'Params': [params],
@@ -1105,6 +1022,66 @@ class ModelFramework:
         
         print(f"Completed: {processed} combinations processed, {skipped} combinations skipped.")
         return accuracy_df
+    
+    def evaluate_grid_parallel(self, C_tr_values, C_inf_values, output_file=None, replace=False, n_jobs=-1):
+        """Parallelized version of evaluate_grid"""
+        # Import necessary libraries
+        try:
+            from joblib import Parallel, delayed
+            from tqdm.auto import tqdm
+        except ImportError:
+            print("Install joblib and tqdm for parallel processing and progress bars")
+            return self.evaluate_grid(C_tr_values, C_inf_values, output_file, replace)
+        
+        # Define a worker function that processes one (C_tr, C_inf) pair
+        def process_pair(C_tr, C_inf):
+            # Train for this C_tr
+            self.train(C_tr)
+            params = np.sqrt(C_tr / (6 * self.kappa * self.zeta**2))
+            tokens = C_inf / (2 * params * self.omega)
+            
+            # Evaluate
+            accuracy, inf_cost = self.evaluate_allocation_all(C_tr, C_inf)
+            
+            return {
+                'C_tr': C_tr,
+                'C_inf': inf_cost,
+                'C_inf_allocated': C_inf,
+                'Accuracy': accuracy,
+                'Policy': self.policy_type.value,
+                'Params': params,
+                'Tokens': tokens
+            }
+        
+        # Generate all pairs to evaluate
+        pairs = [(C_tr, C_inf) for C_tr in C_tr_values for C_inf in C_inf_values]
+        
+        # Process in parallel with progress bar
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(process_pair)(C_tr, C_inf) 
+            for C_tr, C_inf in tqdm(pairs, desc="Evaluating pairs")
+        )
+        
+        # Convert results to DataFrame
+        new_df = pd.DataFrame(results)
+        
+        # Handle existing file if needed
+        if output_file and os.path.exists(output_file) and not replace:
+            try:
+                existing_df = pd.read_csv(output_file)
+                df = pd.concat([existing_df, new_df], ignore_index=True)
+                df = df.drop_duplicates(subset=['C_tr', 'C_inf_allocated', 'Policy'])
+            except Exception as e:
+                print(f"Error reading existing file: {e}")
+                df = new_df
+        else:
+            df = new_df
+        
+        # Save results
+        if output_file:
+            df.to_csv(output_file, index=False)
+            
+        return df
     
     def plot_accuracy_vs_C_inf(self, accuracy_df=None, C_tr_values=None, figsize=(10, 6), save_path=None):
         """
@@ -1723,54 +1700,9 @@ class BestOfNModel(ModelFramework):
         kwargs['policy_params']['n_samples'] = n_samples
         super().__init__(**kwargs)
     
-    def compute_inference_cost_best_of_N(self, R, N_star):
-        """
-        Compute the inference cost for Best of N.
-        
-        Args:
-            R (float): R parameter
-            N_star (float): N* value
-            
-        Returns:
-            float: Inference cost
-        """
-        # Get n_samples from policy_params
-        n_samples = self.policy_params.get('n_samples', 3)
-        
-        # For Best of N, the total inference cost is the base cost multiplied by n_samples
-        # Each sample gets an equal portion of the total steps budget
-        base_cost = super().compute_inference_cost_COT(R, N_star / n_samples)
-        
-        return n_samples * base_cost
-    
-    def compute_accuracy_best_of_N(self, gamma_l_star, m_l_star, r_l_star, N_star):
-        """
-        Custom implementation for Best of N accuracy.
-        
-        Args:
-            gamma_l_star (float): gamma_l* value
-            m_l_star (float): m_l* value
-            r_l_star (float): r_l* value
-            N_star (float): N* value
-            
-        Returns:
-            float: Accuracy
-        """
-        # Get n_samples from policy_params
-        n_samples = self.policy_params.get('n_samples', 3)
-        
-        # Base accuracy with budget divided equally among samples
-        base_accuracy = super().compute_accuracy_COT(gamma_l_star, m_l_star, r_l_star, N_star / n_samples)
-        
-        # Best-of-N accuracy: probability that at least one of N samples is correct
-        # P(at least one correct) = 1 - P(all incorrect) = 1 - (1-p)^N
-        best_of_n_accuracy = 1 - (1 - base_accuracy) ** n_samples
-        
-        return best_of_n_accuracy
-    
     def evaluate_allocation_best_of_N(self, C_tr, C_inf, l, m, p_values=None, gamma_values=None):
         """
-        Evaluate allocation with Best of N for  l and m.
+        Evaluate allocation with Best of N for fixed l and m.
         
         Args:
             C_tr (float): Training cost
@@ -1781,7 +1713,7 @@ class BestOfNModel(ModelFramework):
             gamma_values (list, optional): Pre-computed gamma values
             
         Returns:
-            float: Accuracy
+            tuple: (accuracy, actual_inference_cost)
         """
         # Ensure p_values and gamma_values are available
         if p_values is None or gamma_values is None:
@@ -1793,12 +1725,12 @@ class BestOfNModel(ModelFramework):
         # Calculate R from C_tr
         R = np.sqrt(C_tr / (6 * self.kappa * self.zeta**2))
 
-        # Compute steps from C_inf, divided by n_samples since each sample gets an equal portion
-        steps_per_sample = C_inf / (2 * self.zeta * R * self.omega * n_samples)
+        # Compute steps per sample from C_inf
+        K_max_per_sample = C_inf / (n_samples * 2 * self.zeta * R * self.omega)
         
         # Find best l_star for this allocation
         best_accuracy = 0
-        best_params = {}
+        cost = n_samples * 2 * self.zeta * R * self.omega * K_max_per_sample
         
         # Find if any p_values is 1 and if so store index
         p_is_1_index = np.where(np.array(p_values) == 1)[0]
@@ -1808,33 +1740,30 @@ class BestOfNModel(ModelFramework):
         for l_prime in range(l_min, self.L_max + 1):
             p_l_prime = p_values[l_prime]
             gamma_l_prime = gamma_values[l_prime]
-            m_l_prime = self.compute_m_l_prime(l, l_prime, m)
-            M_l_prime = self.compute_M_l_prime(m_l_prime)
+            
+            # Skip if gamma is 0
+            if gamma_l_prime == 0:
+                break
+                
+            gamma_l_prime = gamma_values[l_prime]
+            m_l_prime = super().compute_m_l_prime(l, l_prime, m)
+            M_l_prime = super().compute_M_l_prime(m_l_prime)
             p_eff = p_l_prime * (self.rho / M_l_prime + 1-self.rho)
             r_l_prime = p_eff * self.q(p_l_prime)
             
             # Calculate base accuracy for a single sample
-            base_accuracy = super().compute_accuracy_COT(gamma_l_prime, m_l_prime, r_l_prime, steps_per_sample)
+            base_accuracy = super().compute_accuracy_COT(gamma_l_prime, m_l_prime, r_l_prime, K_max_per_sample)
             
             # Calculate Best-of-N accuracy
             accuracy = 1 - (1 - base_accuracy) ** n_samples
             
             if accuracy > best_accuracy:
                 best_accuracy = accuracy
-                best_params = {
-                    'l_star': l_prime,
-                    'm_l_star': m_l_prime,
-                    'r_l_star': r_l_prime,
-                    'gamma_l_star': gamma_l_prime
-                }
-
-            if p_l_prime == 0:
-                break
+                # Calculate expected steps per sample and total actual inference cost
+                expected_steps_per_sample = super().compute_expected_steps_cot(gamma_l_prime, m_l_prime, r_l_prime, K_max_per_sample)
+                cost = n_samples * 2 * self.zeta * R * self.omega * expected_steps_per_sample
         
-        # Store optimal parameters for later use
-        self._optimal_params = best_params
-        
-        return best_accuracy
+        return best_accuracy, cost
 
 
 class MarkovTreeSearchModel(ModelFramework):
@@ -1855,112 +1784,9 @@ class MarkovTreeSearchModel(ModelFramework):
         kwargs['policy_params']['branching_factor'] = branching_factor
         super().__init__(**kwargs)
     
-    def compute_expected_steps_variable_cot(self, gamma_l_star, m_l_star, r_l_star, K_max):
-        """
-        Compute the expected number of steps needed for variable Chain of Thought.
-        Used as a building block for MCTS calculations.
-        
-        Args:
-            gamma_l_star (float): gamma_l* value
-            m_l_star (float): m_l* value
-            r_l_star (float): r_l* value
-            K_max (float): Maximum number of steps
-            
-        Returns:
-            float: Expected number of steps
-        """
-        # Initialize
-        expected_steps = 0
-        m = int(np.ceil(m_l_star))  # Ensure m is an integer
-        r = r_l_star
-        gamma = gamma_l_star
-        
-        # Calculate using the summation formula
-        for k in range(m, int(np.ceil(K_max)) + 1):
-            # Calculate beta incomplete for k-m+1 and k-m
-            beta_k_plus_1 = betainc(m, k-m+1, r)
-            beta_k = betainc(m, k-m, r) if k > m else 0
-            
-            # Add to expected steps
-            expected_steps += k * (gamma**m * beta_k_plus_1 - gamma**m * beta_k)
-        
-        # Add the final term for K_max
-        expected_steps += K_max * (1 - gamma**m * betainc(m, K_max-m+1, r))
-        
-        return expected_steps
-    
-    def compute_inference_cost_markov_tree_search(self, R, N_star):
-        """
-        Compute the inference cost for Markov Tree Search.
-        
-        Args:
-            R (float): R parameter
-            N_star (float): N* value
-            
-        Returns:
-            float: Inference cost
-        """
-        # Get parameters from policy_params
-        branching_factor = self.policy_params.get('branching_factor', 3)
-        
-        # Try to get optimal parameters from instance
-        if hasattr(self, '_optimal_params') and self._optimal_params:
-            gamma_l_star = self._optimal_params.get('gamma_l_star')
-            m_l_star = self._optimal_params.get('m_l_star')
-            r_l_star = self._optimal_params.get('r_l_star')
-            
-            if gamma_l_star and m_l_star and r_l_star:
-                # Improved r for MCTS using the formula r_MCTS = 1-(1-r_CoT)^b
-                r_mcts = 1 - (1 - r_l_star) ** branching_factor
-                
-                # Effective number of steps for MCTS (divide by branching factor)
-                K_max = N_star / branching_factor
-                
-                # Compute expected steps for MCTS
-                expected_steps = self.compute_expected_steps_variable_cot(
-                    gamma_l_star, m_l_star, r_mcts, K_max)
-                
-                # Multiply by branching factor for total cost
-                total_expected_steps = expected_steps * branching_factor
-                
-                return 2 * self.zeta * R * self.omega * total_expected_steps
-        
-        # Fallback to basic formula with adjustment for branching factor
-        nodes_per_step = branching_factor
-        return 2 * self.zeta * R * self.omega * N_star * nodes_per_step
-    
-    def compute_accuracy_markov_tree_search(self, gamma_l_star, m_l_star, r_l_star, N_star):
-        """
-        Custom implementation for Markov Tree Search accuracy.
-        
-        Args:
-            gamma_l_star (float): gamma_l* value
-            m_l_star (float): m_l* value
-            r_l_star (float): r_l* value
-            N_star (float): N* value
-            
-        Returns:
-            float: Accuracy
-        """
-        # Get parameters from policy_params
-        branching_factor = self.policy_params.get('branching_factor', 3)
-        
-        # Improved r for MCTS using the formula r_MCTS = 1-(1-r_CoT)^b
-        r_mcts = 1 - (1 - r_l_star) ** branching_factor
-        
-        # Calculate the effective N per node
-        # Each step in MCTS involves evaluating branching_factor nodes
-        effective_steps = N_star / branching_factor
-        
-        # Use the MTS accuracy formula based on the incomplete beta function
-        mts_accuracy = gamma_l_star**m_l_star * betainc(
-            m_l_star, int(np.floor(effective_steps))-m_l_star+1, r_mcts)
-        
-        return mts_accuracy
-    
     def evaluate_allocation_markov_tree_search(self, C_tr, C_inf, l, m, p_values=None, gamma_values=None):
         """
-        Evaluate allocation with Markov Tree Search for  l and m.
+        Evaluate allocation with Markov Tree Search for fixed l and m.
         
         Args:
             C_tr (float): Training cost
@@ -1971,7 +1797,7 @@ class MarkovTreeSearchModel(ModelFramework):
             gamma_values (list, optional): Pre-computed gamma values
             
         Returns:
-            float: Accuracy
+            tuple: (accuracy, actual_inference_cost)
         """
         # Ensure p_values and gamma_values are available
         if p_values is None or gamma_values is None:
@@ -1983,15 +1809,12 @@ class MarkovTreeSearchModel(ModelFramework):
         # Calculate R from C_tr
         R = np.sqrt(C_tr / (6 * self.kappa * self.zeta**2))
 
-        # Compute total number of node evaluations from C_inf
-        total_nodes = C_inf / (2 * self.zeta * R * self.omega)
-        
-        # Effective steps are total nodes divided by branching factor
-        effective_steps = total_nodes / branching_factor
+        # Compute effective steps from C_inf (accounting for branching factor)
+        K_max_effective = C_inf / (branching_factor * 2 * self.zeta * R * self.omega)
         
         # Find best l_star for this allocation
         best_accuracy = 0
-        best_params = {}
+        cost = branching_factor * 2 * self.zeta * R * self.omega * K_max_effective
         
         # Find if any p_values is 1 and if so store index
         p_is_1_index = np.where(np.array(p_values) == 1)[0]
@@ -2001,8 +1824,14 @@ class MarkovTreeSearchModel(ModelFramework):
         for l_prime in range(l_min, self.L_max + 1):
             p_l_prime = p_values[l_prime]
             gamma_l_prime = gamma_values[l_prime]
-            m_l_prime = self.compute_m_l_prime(l, l_prime, m)
-            M_l_prime = self.compute_M_l_prime(m_l_prime)
+            
+            # Skip if gamma is 0
+            if gamma_l_prime == 0:
+                break
+                
+            gamma_l_prime = gamma_values[l_prime]
+            m_l_prime = super().compute_m_l_prime(l, l_prime, m)
+            M_l_prime = super().compute_M_l_prime(m_l_prime)
             p_eff = p_l_prime * (self.rho / M_l_prime + 1-self.rho)
             r_l_prime = p_eff * self.q(p_l_prime)
             
@@ -2010,26 +1839,15 @@ class MarkovTreeSearchModel(ModelFramework):
             r_mcts = 1 - (1 - r_l_prime) ** branching_factor
             
             # Calculate accuracy using MCTS approach
-            accuracy = gamma_l_prime**m_l_prime * betainc(
-                m_l_prime, int(np.floor(effective_steps))-m_l_prime+1, r_mcts)
+            accuracy = super().compute_accuracy_COT(gamma_l_prime, m_l_prime, r_mcts, K_max_effective)
             
             if accuracy > best_accuracy:
                 best_accuracy = accuracy
-                best_params = {
-                    'l_star': l_prime,
-                    'm_l_star': m_l_prime,
-                    'r_l_star': r_l_prime,
-                    'gamma_l_star': gamma_l_prime
-                }
-
-            if p_l_prime == 0:
-                break
+                # Calculate expected steps and actual inference cost
+                expected_steps = super().compute_expected_steps_cot(gamma_l_prime, m_l_prime, r_mcts, K_max_effective)
+                cost = branching_factor * 2 * self.zeta * R * self.omega * expected_steps
         
-        # Store optimal parameters for later use
-        self._optimal_params = best_params
-        
-        return best_accuracy
-
+        return best_accuracy, cost
 
 class ConsensusModel(ModelFramework):
     """
@@ -2054,58 +1872,9 @@ class ConsensusModel(ModelFramework):
         kwargs['policy_params']['consensus_count'] = consensus_count
         super().__init__(**kwargs)
     
-    def compute_accuracy_consensus(self, gamma_l_star, m_l_star, r_l_star, N_star):
-        """
-        Compute accuracy for Consensus Voting.
-        
-        Args:
-            gamma_l_star (float): gamma_l* value
-            m_l_star (float): m_l* value
-            r_l_star (float): r_l* value
-            N_star (float): N* value
-            
-        Returns:
-            float: Accuracy
-        """
-        # Get consensus_count from policy_params
-        N_con = self.policy_params.get('consensus_count', 5)
-        
-        # Base accuracy with budget divided equally
-        steps_per_trial = N_star / N_con
-        
-        # Base policy success probability
-        psi_0 = gamma_l_star**m_l_star * betainc(m_l_star, int(np.floor(steps_per_trial))-m_l_star+1, r_l_star)
-        
-        # Assuming binary consensus (success vs. failure)
-        # Use regularized incomplete beta function to compute probability of majority success
-        maj_threshold = np.ceil((N_con + 1) / 2)
-        consensus_acc = betainc(maj_threshold, N_con-maj_threshold+1, psi_0)
-        
-        return consensus_acc
-    
-    def compute_inference_cost_consensus(self, R, N_star):
-        """
-        Compute inference cost for Consensus Voting.
-        
-        Args:
-            R (float): R parameter
-            N_star (float): N* value
-            
-        Returns:
-            float: Inference cost
-        """
-        # Get consensus_count from policy_params
-        N_con = self.policy_params.get('consensus_count', 5)
-        
-        # Base CoT cost per trial
-        base_cost = super().compute_inference_cost_COT(R, N_star / N_con)
-        
-        # Total cost is N_con times the cost per trial
-        return N_con * base_cost
-    
     def evaluate_allocation_consensus(self, C_tr, C_inf, l, m, p_values=None, gamma_values=None):
         """
-        Evaluate allocation with Consensus Voting for  l and m.
+        Evaluate allocation with Consensus for fixed l and m.
         
         Args:
             C_tr (float): Training cost
@@ -2116,7 +1885,7 @@ class ConsensusModel(ModelFramework):
             gamma_values (list, optional): Pre-computed gamma values
             
         Returns:
-            float: Accuracy
+            tuple: (accuracy, actual_inference_cost)
         """
         # Ensure p_values and gamma_values are available
         if p_values is None or gamma_values is None:
@@ -2128,12 +1897,12 @@ class ConsensusModel(ModelFramework):
         # Calculate R from C_tr
         R = np.sqrt(C_tr / (6 * self.kappa * self.zeta**2))
 
-        # Compute steps from C_inf, divided by N_con
-        steps_per_trial = C_inf / (2 * self.zeta * R * self.omega * N_con)
+        # Compute steps per trial from C_inf
+        K_max_per_trial = C_inf / (N_con * 2 * self.zeta * R * self.omega)
         
         # Find best l_star for this allocation
         best_accuracy = 0
-        best_params = {}
+        cost = K_max_per_trial * N_con
         
         # Find if any p_values is 1 and if so store index
         p_is_1_index = np.where(np.array(p_values) == 1)[0]
@@ -2143,36 +1912,31 @@ class ConsensusModel(ModelFramework):
         for l_prime in range(l_min, self.L_max + 1):
             p_l_prime = p_values[l_prime]
             gamma_l_prime = gamma_values[l_prime]
-            m_l_prime = self.compute_m_l_prime(l, l_prime, m)
-            M_l_prime = self.compute_M_l_prime(m_l_prime)
+            
+            # Skip if gamma is 0
+            if gamma_l_prime == 0:
+                break
+                
+            gamma_l_prime = gamma_values[l_prime]
+            m_l_prime = super().compute_m_l_prime(l, l_prime, m)
+            M_l_prime = super().compute_M_l_prime(m_l_prime)
             p_eff = p_l_prime * (self.rho / M_l_prime + 1-self.rho)
             r_l_prime = p_eff * self.q(p_l_prime)
             
             # Base policy success probability
-            psi_0 = gamma_l_prime**m_l_prime * betainc(
-                m_l_prime, int(np.floor(steps_per_trial))-m_l_prime+1, r_l_prime)
+            base_accuracy = super().compute_accuracy_COT(gamma_l_prime, m_l_prime, r_l_prime, K_max_per_trial)
             
             # Consensus accuracy calculation
             maj_threshold = np.ceil((N_con + 1) / 2)
-            accuracy = betainc(maj_threshold, N_con-maj_threshold+1, psi_0)
+            accuracy = betainc(maj_threshold, N_con-maj_threshold+1, base_accuracy)
             
             if accuracy > best_accuracy:
                 best_accuracy = accuracy
-                best_params = {
-                    'l_star': l_prime,
-                    'm_l_star': m_l_prime,
-                    'r_l_star': r_l_prime,
-                    'gamma_l_star': gamma_l_prime
-                }
-
-            if p_l_prime == 0:
-                break
+                # Calculate expected steps per trial and total actual inference cost
+                expected_steps_per_trial = super().compute_expected_steps_cot(gamma_l_prime, m_l_prime, r_l_prime, K_max_per_trial)
+                cost = N_con * 2 * self.zeta * R * self.omega * expected_steps_per_trial
         
-        # Store optimal parameters for later use
-        self._optimal_params = best_params
-        
-        return best_accuracy
-
+        return best_accuracy, cost
 
 class CustomDistributionModel(ModelFramework):
     """
@@ -2273,13 +2037,13 @@ def run_example():
         'tau': 1e4,
         'omega': 25,
         'kappa': 20,
-        'beta': 2,
+        'beta': 3,
         'rho': 1
     }
     
     # Define base ranges for grid evaluation
-    base_C_tr_values = np.logspace(18, 25, 8)  
-    base_C_inf_values = np.logspace(9, 20, 8)  
+    base_C_tr_values = np.logspace(18, 25, 10)  
+    base_C_inf_values = np.logspace(9, 20, 10)  
     
     # Initialize results dataframe
     all_results_df = pd.DataFrame()
@@ -2289,7 +2053,13 @@ def run_example():
     cot_model = ModelFramework(constants=constants, policy_type=InferencePolicy.COT)
     
     # Evaluate with baseline budget
-    cot_df = cot_model.evaluate_grid(
+    #cot_df = cot_model.evaluate_grid(
+    #    base_C_tr_values, base_C_inf_values, 
+    #    output_file="accuracy_results_cot.csv",
+    #    replace=True
+    #)
+
+    cot_df = cot_model.evaluate_grid_parallel(
         base_C_tr_values, base_C_inf_values, 
         output_file="accuracy_results_cot.csv",
         replace=True
@@ -2303,7 +2073,7 @@ def run_example():
         plot_model_results(cot_model, cot_df, "cot")
     except Exception as e:
         print(f"Error plotting for COT model: {e}")
-    
+    """
     # 2. TEST MCTS MODEL WITH 3X BUDGET
     print("Evaluating MCTS model with 3x inference budget...")
     branching_factor = 3
@@ -2382,7 +2152,7 @@ def run_example():
     
     # Save combined results
     all_results_df.to_csv("all_models_results.csv", index=False)
-    
+    """
     # Create comparison plots
     try:
         plot_model_comparisons(all_results_df)
