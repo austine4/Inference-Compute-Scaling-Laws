@@ -25,18 +25,18 @@ class ModelFramework:
     
     # Default constants
     DEFAULT_CONSTANTS = {
-        'L_min': 1,  # Minimum skill level
-        'L_max': 50, # Maximum skill level
+        'L_min': 5,  # Minimum skill level
+        'L_max': 30, # Maximum skill level
         'm_min': 2, # Minimum number of skills
-        'm_max': 25, # Maximum number of skills
-        'S_l': 1e3, # Number of skills per level
+        'm_max': 30, # Maximum number of skills
+        'S_l': 4e4, # Number of skills per level
         'd_t': 6, # Degrees of text pieces (number of skills required to understand a text) is binomially distributed with a fixed mean degree, d_t
         'zeta': 2.5e3, # Parameters per concept
         'tau': 1e4, # Tokens per training text piece
         'omega': 25, # Output tokens per inference step
         'kappa': 20, # D_tr / N for chinchilla optimal
         'beta': 2, # Factor to scale skills required to relevant set
-        'rho': .5 # Search efficiency between relevant and required sets
+        'rho': 1 # Search efficiency between relevant and required sets
     }
     
     def __init__(self, 
@@ -82,7 +82,7 @@ class ModelFramework:
         Returns:
             float: eta_l value
         """
-        return np.exp(7 * l / self.L_max)
+        return np.exp(5 * l / self.L_max)
     
     def sigma_l(self, l):
         """
@@ -103,6 +103,7 @@ class ModelFramework:
         if l < self.L_min or l > self.L_max:
             return 0
         phi_l = 1/(self.L_max-self.L_min+1)
+
         """
         # Parameters for the three components:
         mu1, mu2, mu3 = 30, 60, 90      # centers for the peaks
@@ -431,10 +432,10 @@ class ModelFramework:
 
         # Do to massive K_max, we approximate:
         expected_steps = min(K_max, m_l_star/r_l_star)
-
+        print(expected_steps)
         return expected_steps
 
-    def compute_accuracy_COT(self, gamma_l_star, m_l_star, r_l_star, N_star):
+    def compute_accuracy_COT(self, gamma_l_star, m_l_star, r_l_star, K_max):
         """
         Compute the accuracy for Chain of Thought.
         
@@ -442,12 +443,12 @@ class ModelFramework:
             gamma_l_star (float): gamma_l* value
             m_l_star (float): m_l* value
             r_l_star (float): r_l* value
-            N_star (float): N* value
+            K_max (float): N* value
             
         Returns:
             float: Accuracy
         """
-        return (gamma_l_star ** m_l_star) * betainc(m_l_star, N_star - m_l_star + 1, r_l_star)
+        return (gamma_l_star ** m_l_star) * betainc(m_l_star, K_max - m_l_star + 1, r_l_star)
     
     # =========================================================================
     # EVALUATION FUNCTIONS
@@ -992,12 +993,21 @@ class ModelFramework:
                         skipped += 1
                         continue
                 
-                # Calculate tokens based on C_inf and params
-                tokens = C_inf / (2 * params * self.omega)
-                
                 # Evaluate accuracy and cost
                 accuracy, actual_cost = self.evaluate_allocation_all(C_tr, C_inf)
                 processed += 1
+                
+                # Calculate the actual number of steps used
+                # actual_cost = steps * 2 * self.zeta * params * self.omega
+                # So: steps = actual_cost / (2 * self.zeta * params * self.omega)
+                steps_used = actual_cost / (2 * self.zeta * params * self.omega)
+                
+                # Calculate tokens correctly from steps (each step uses omega tokens)
+                tokens = steps_used * self.omega
+                
+                # For debugging - show both calculations
+                allocated_tokens = C_inf / (2 * self.zeta * params * self.omega)
+                print(f"Allocated tokens: {allocated_tokens}, Used tokens: {tokens}")
                 
                 # Remove existing row if replacing
                 if replace:
@@ -1013,7 +1023,7 @@ class ModelFramework:
                     'Accuracy': [accuracy],
                     'Policy': [policy_id],
                     'Params': [params],
-                    'Tokens': [tokens]
+                    'Tokens': [tokens]  # Correctly calculated tokens based on steps
                 })
                 accuracy_df = pd.concat([accuracy_df, new_row], ignore_index=True)
                 
@@ -1023,7 +1033,7 @@ class ModelFramework:
         
         print(f"Completed: {processed} combinations processed, {skipped} combinations skipped.")
         return accuracy_df
-    
+
     def evaluate_grid_parallel(self, C_tr_values, C_inf_values, output_file=None, replace=False, n_jobs=-1):
         """Parallelized version of evaluate_grid"""
         # Import necessary libraries
@@ -1039,19 +1049,24 @@ class ModelFramework:
             # Train for this C_tr
             self.train(C_tr)
             params = np.sqrt(C_tr / (6 * self.kappa * self.zeta**2))
-            tokens = C_inf / (2 * params * self.omega)
             
             # Evaluate
-            accuracy, inf_cost = self.evaluate_allocation_all(C_tr, C_inf)
+            accuracy, actual_cost = self.evaluate_allocation_all(C_tr, C_inf)
+            
+            # Calculate the actual number of steps used
+            steps_used = actual_cost / (2 * self.zeta * params * self.omega)
+            
+            # Calculate tokens correctly from steps
+            tokens = steps_used * self.omega
             
             return {
                 'C_tr': C_tr,
-                'C_inf': inf_cost,
+                'C_inf': actual_cost,
                 'C_inf_allocated': C_inf,
                 'Accuracy': accuracy,
                 'Policy': self.policy_type.value,
                 'Params': params,
-                'Tokens': tokens
+                'Tokens': tokens  # Correctly calculated tokens
             }
         
         # Generate all pairs to evaluate
@@ -1297,6 +1312,12 @@ class ModelFramework:
         for C_tr, group in df.groupby("C_tr"):
             ax.plot(group["Tokens"], group["Accuracy"], marker='o', label=f'{C_tr:.2e}')
         
+
+        # TESTING
+        # Load 'Claude_3_7_Sonnet_Estimated_Aime_df.csv'
+        cl = pd.read_csv('Claude_3_7_Sonnet_Estimated_Aime_df.csv')
+        plt.plot(cl['Tokens'], cl['Accuracy'], marker='o', label='Estimated AIME')
+
         # Add legend
         ax.legend(title="Training Compute")
         
@@ -2021,30 +2042,32 @@ class CustomEtaSigmaModel(ModelFramework):
             return super().sigma_l(l)
 
 
-def run_example():
+def run_example(constants):
     """
     Example demonstrating how to use the framework with various model types.
     Tests each inference policy with appropriate budget scaling.
     """
     # Define constants
+    """
     constants = {
-        'L_min': 1,
-        'L_max': 100,
-        'm_min': 2,  # Minimum difficulty level
-        'm_max': 50,  # Maximum difficulty level
-        'S_l': 1e4,
-        'd_t': 6,
-        'zeta': 2.5e3,
-        'tau': 1e4,
-        'omega': 25,
-        'kappa': 20,
-        'beta': 3,
-        'rho': 1
+        'L_min': 20,  # Minimum skill level
+        'L_max': 80, # Maximum skill level
+        'm_min': 10, # Minimum number of skills
+        'm_max': 20, # Maximum number of skills
+        'S_l': 1.1e4, # Number of skills per level
+        'd_t': 6, # Degrees of text pieces (number of skills required to understand a text) is binomially distributed with a fixed mean degree, d_t
+        'zeta': 2.5e3, # Parameters per concept
+        'tau': 2e4, # Tokens per training text piece
+        'omega': 25, # Output tokens per skill step
+        'kappa': 20, # D_tr / N for chinchilla optimal
+        'beta': 50, # Factor to scale skills required to relevant set
+        'rho': .7 # Search efficiency between relevant and required sets (1 moves curve up and spreads out; 0 moves curve down and narrows)
     }
+    """
     
     # Define base ranges for grid evaluation
-    base_C_tr_values = np.logspace(18, 26, 20)  
-    base_C_inf_values = np.logspace(9, 20, 20)  
+    base_C_tr_values = [3.35e25]#np.logspace(24.5, 26.5, 20)  
+    base_C_inf_values = np.logspace(12, 15, 50)  
     
     # Initialize results dataframe
     all_results_df = pd.DataFrame()
@@ -2070,11 +2093,16 @@ def run_example():
     all_results_df = pd.concat([all_results_df, cot_df], ignore_index=True)
     
     # Plot results
-    try:
-        plot_model_results(cot_model, cot_df, "cot")
-    except Exception as e:
-        print(f"Error plotting for COT model: {e}")
-    
+    #try:
+        #plot_model_results(cot_model, cot_df, "cot")
+    #except Exception as e:
+    #    print(f"Error plotting for COT model: {e}")
+
+    cot_model.plot_accuracy_vs_tokens(
+        accuracy_df=cot_df,
+        save_path=f"accuracy_vs_tokens_{cot_model}.png"
+    )
+    """
     # 2. TEST MCTS MODEL WITH 3X BUDGET
     print("Evaluating MCTS model with 3x inference budget...")
     branching_factor = 3
@@ -2150,17 +2178,17 @@ def run_example():
             plot_model_results(consensus_model, consensus_df, "consensus")
         except Exception as e:
             print(f"Error plotting for Consensus model: {e}")
-    
+    """
     # Save combined results
-    all_results_df.to_csv("all_models_results.csv", index=False)
+    #all_results_df.to_csv("all_models_results.csv", index=False)
     
     # Create comparison plots
-    try:
-        plot_model_comparisons(all_results_df)
-    except Exception as e:
-        print(f"Error creating comparison plots: {e}")
+    #try:
+    #    plot_model_comparisons(all_results_df)
+    #except Exception as e:
+    #    print(f"Error creating comparison plots: {e}")
     
-    print("Evaluation complete. Results saved.")
+    #print("Evaluation complete. Results saved.")
     
     return all_results_df
 
