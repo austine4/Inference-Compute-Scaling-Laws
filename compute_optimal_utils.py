@@ -9,6 +9,7 @@ from scipy.interpolate import griddata, LinearNDInterpolator
 import warnings
 import os
 from enum import Enum
+from scipy.stats import binom
 warnings.filterwarnings('ignore')
 
 class InferencePolicy(Enum):
@@ -25,8 +26,9 @@ class ModelFramework:
     
     # Default constants
     DEFAULT_CONSTANTS = {
-        'L_min': 5,  # Minimum skill level
-        'L_max': 30, # Maximum skill level
+        'L': 20, # Total number of skill levels
+        'L_min': 5,  # Minimum skill level task
+        'L_max': 10, # Maximum skill level task
         'm_min': 2, # Minimum number of skills
         'm_max': 30, # Maximum number of skills
         'S_l': 4e4, # Number of skills per level
@@ -82,7 +84,7 @@ class ModelFramework:
         Returns:
             float: eta_l value
         """
-        return np.exp(5 * l / self.L_max)
+        return np.exp(5 * l / self.L)
     
     def sigma_l(self, l):
         """
@@ -95,6 +97,7 @@ class ModelFramework:
             float: sigma_l value
         """
         return np.log2(l) if l > 1 else 0
+    
     
     # Task distribution function over l,m
     def phi(self, l,m):
@@ -135,6 +138,40 @@ class ModelFramework:
         phi_m = (phi_m_unnormalized / phi_m_unnormalized.sum())[m-2]
         """
         return phi_l * phi_m
+    
+    
+    def phi_non(self, l, m, exp=1):
+        """
+        Compute the joint probability phi(l, m) = p(l) * p(m) with:
+        
+        p(l)  ∝ (l - L_min + 1)^alpha,
+        p(m)  ∝ ((m - m_min + 1) * (m_max - m + 1))^beta
+        
+        Parameters:
+            l (int): Task skill level.
+            m (int): Number of skills.
+            alpha (float): Exponent controlling the shape of the p(l) distribution.
+            beta (float): Exponent controlling the peak sharpness of the p(m) distribution.
+            
+        Returns:
+            float: The joint probability phi(l, m), or 0 if l or m is outside the allowed range.
+        """
+        # Check if l and m are within bounds.
+        if l < self.L_min or l > self.L_max or m < self.m_min or m > self.m_max:
+            return 0
+
+        # Compute p(l) with a monomial weighting.
+        weight_l = (l - self.L_min + 1)**exp
+        norm_l = sum((j - self.L_min + 1)**exp for j in range(self.L_min, self.L_max + 1))
+        p_l = weight_l / norm_l
+
+        # Compute p(m) with a center-peaking weighting.
+        weight_m = ((m - self.m_min + 1) * (self.m_max - m + 1))**exp
+        norm_m = sum(((j - self.m_min + 1) * (self.m_max - j + 1))**exp for j in range(self.m_min, self.m_max + 1))
+        p_m = weight_m / norm_m
+
+        return p_l * p_m
+    
     
     def q(self, p):
         """
@@ -269,19 +306,19 @@ class ModelFramework:
             gamma_l = 0
         return gamma_l
     
-    def compute_recursive_values(self, R, l_max=None):
+    def compute_recursive_values(self, R, l_cap=None):
         """
-        Compute p_l and gamma_l recursively for all levels up to l_max.
+        Compute p_l and gamma_l recursively for all levels up to l.
         
         Args:
             R (float): R parameter
-            l_max (int, optional): Maximum level. Defaults to self.L_max.
+            l_cap (int, optional): Maximum level. Defaults to self.L.
             
         Returns:
             tuple: (p_values, gamma_values)
         """
-        if l_max is None:
-            l_max = self.L_max
+        if l_cap is None:
+            l_cap = self.L
             
         # Initialize with base conditions
         gamma_values = [1.0]  # gamma_0 = 1
@@ -294,7 +331,7 @@ class ModelFramework:
         p_rr = self.compute_p_rr(R, T, self.d_t)
         
         # Recursively compute p_l and gamma_l for each level
-        for l in range(1, l_max + 1):
+        for l in range(1, l_cap + 1):
             gamma_prev = gamma_values[l-1]
             sigma = self.sigma_l(l)
             eta = self.eta_l(l)
@@ -304,6 +341,9 @@ class ModelFramework:
             
             gamma_l = self.compute_gamma_l(p_l)
             gamma_values.append(gamma_l)
+
+
+        
         
         return p_values, gamma_values
     
@@ -432,7 +472,6 @@ class ModelFramework:
 
         # Do to massive K_max, we approximate:
         expected_steps = min(K_max, m_l_star/r_l_star)
-        print(expected_steps)
         return expected_steps
 
     def compute_accuracy_COT(self, gamma_l_star, m_l_star, r_l_star, K_max):
@@ -468,7 +507,7 @@ class ModelFramework:
         R = np.sqrt(C_tr / (6 * self.kappa * self.zeta**2))
         
         # Compute recursive values
-        p_values, gamma_values = self.compute_recursive_values(R, l_max=self.L_max)
+        p_values, gamma_values = self.compute_recursive_values(R, l_cap=self.L)
         
         # Cache the values
         self._p_values = p_values
@@ -494,7 +533,7 @@ class ModelFramework:
         # Ensure p_values and gamma_values are available
         if p_values is None or gamma_values is None:
             p_values, gamma_values = self.train(C_tr)
-            
+        
         # Calculate R from C_tr
         R = np.sqrt(C_tr / (6 * self.kappa * self.zeta**2))
 
@@ -533,202 +572,6 @@ class ModelFramework:
                 expected_steps = self.compute_expected_steps_cot(gamma_l_prime, m_l_prime, r_l_prime, K_max)
                 cost = 2 * self.zeta * R * self.omega * expected_steps
 
-        return best_accuracy, cost
-
-    def evaluate_allocation_best_of_N(self, C_tr, C_inf, l, m, p_values=None, gamma_values=None):
-        """
-        Evaluate allocation with Best of N for fixed l and m.
-        
-        Args:
-            C_tr (float): Training cost
-            C_inf (float): Inference cost
-            l (int): Skill level
-            m (int): Difficulty parameter
-            p_values (list, optional): Pre-computed p values
-            gamma_values (list, optional): Pre-computed gamma values
-            
-        Returns:
-            tuple: (accuracy, actual_inference_cost)
-        """
-        # Ensure p_values and gamma_values are available
-        if p_values is None or gamma_values is None:
-            p_values, gamma_values = self.train(C_tr)
-        
-        # Get n_samples from policy_params
-        n_samples = self.policy_params.get('n_samples', 3)
-        
-        # Calculate R from C_tr
-        R = np.sqrt(C_tr / (6 * self.kappa * self.zeta**2))
-
-        # Compute steps per sample from C_inf
-        K_max_per_sample = C_inf / (n_samples * 2 * self.zeta * R * self.omega)
-        
-        # Find best l_star for this allocation
-        best_accuracy = 0
-        cost = n_samples * 2 * self.zeta * R * self.omega * K_max_per_sample
-        
-        # Find if any p_values is 1 and if so store index
-        p_is_1_index = np.where(np.array(p_values) == 1)[0]
-        l_min = 1 if len(p_is_1_index) == 0 else p_is_1_index[-1]
-
-        # Try different l_star values
-        for l_prime in range(l_min, self.L_max + 1):
-            p_l_prime = p_values[l_prime]
-            gamma_l_prime = gamma_values[l_prime]
-            
-            # Skip if gamma is 0
-            if gamma_l_prime == 0:
-                break
-                
-            gamma_l_prime = gamma_values[l_prime]
-            m_l_prime = self.compute_m_l_prime(l, l_prime, m)
-            M_l_prime = self.compute_M_l_prime(m_l_prime)
-            p_eff = p_l_prime * (self.rho / M_l_prime + 1-self.rho)
-            r_l_prime = p_eff * self.q(p_l_prime)
-            
-            # Calculate base accuracy for a single sample
-            base_accuracy = self.compute_accuracy_COT(gamma_l_prime, m_l_prime, r_l_prime, K_max_per_sample)
-            
-            # Calculate Best-of-N accuracy
-            accuracy = 1 - (1 - base_accuracy) ** n_samples
-            
-            if accuracy > best_accuracy:
-                best_accuracy = accuracy
-                # Calculate expected steps per sample and total actual inference cost
-                expected_steps_per_sample = self.compute_expected_steps_cot(gamma_l_prime, m_l_prime, r_l_prime, K_max_per_sample)
-                cost = n_samples * 2 * self.zeta * R * self.omega * expected_steps_per_sample
-        
-        return best_accuracy, cost
-
-    def evaluate_allocation_markov_tree_search(self, C_tr, C_inf, l, m, p_values=None, gamma_values=None):
-        """
-        Evaluate allocation with Markov Tree Search for fixed l and m.
-        
-        Args:
-            C_tr (float): Training cost
-            C_inf (float): Inference cost
-            l (int): Skill level
-            m (int): Difficulty parameter
-            p_values (list, optional): Pre-computed p values
-            gamma_values (list, optional): Pre-computed gamma values
-            
-        Returns:
-            tuple: (accuracy, actual_inference_cost)
-        """
-        # Ensure p_values and gamma_values are available
-        if p_values is None or gamma_values is None:
-            p_values, gamma_values = self.train(C_tr)
-        
-        # Get parameters from policy_params
-        branching_factor = self.policy_params.get('branching_factor', 3)
-        
-        # Calculate R from C_tr
-        R = np.sqrt(C_tr / (6 * self.kappa * self.zeta**2))
-
-        # Compute effective steps from C_inf (accounting for branching factor)
-        K_max_effective = C_inf / (branching_factor * 2 * self.zeta * R * self.omega)
-        
-        # Find best l_star for this allocation
-        best_accuracy = 0
-        cost = branching_factor * 2 * self.zeta * R * self.omega * K_max_effective
-        
-        # Find if any p_values is 1 and if so store index
-        p_is_1_index = np.where(np.array(p_values) == 1)[0]
-        l_min = 1 if len(p_is_1_index) == 0 else p_is_1_index[-1]
-
-        # Try different l_star values
-        for l_prime in range(l_min, self.L_max + 1):
-            p_l_prime = p_values[l_prime]
-            gamma_l_prime = gamma_values[l_prime]
-            
-            # Skip if gamma is 0
-            if gamma_l_prime == 0:
-                break
-                
-            gamma_l_prime = gamma_values[l_prime]
-            m_l_prime = self.compute_m_l_prime(l, l_prime, m)
-            M_l_prime = self.compute_M_l_prime(m_l_prime)
-            p_eff = p_l_prime * (self.rho / M_l_prime + 1-self.rho)
-            r_l_prime = p_eff * self.q(p_l_prime)
-            
-            # Improved r for MCTS
-            r_mcts = 1 - (1 - r_l_prime) ** branching_factor
-            
-            # Calculate accuracy using MCTS approach
-            accuracy = self.compute_accuracy_COT(gamma_l_prime, m_l_prime, r_mcts, K_max_effective)
-            
-            if accuracy > best_accuracy:
-                best_accuracy = accuracy
-                # Calculate expected steps and actual inference cost
-                expected_steps = self.compute_expected_steps_cot(gamma_l_prime, m_l_prime, r_mcts, K_max_effective)
-                cost = branching_factor * 2 * self.zeta * R * self.omega * expected_steps
-        
-        return best_accuracy, cost
-
-    def evaluate_allocation_consensus(self, C_tr, C_inf, l, m, p_values=None, gamma_values=None):
-        """
-        Evaluate allocation with Consensus for fixed l and m.
-        
-        Args:
-            C_tr (float): Training cost
-            C_inf (float): Inference cost
-            l (int): Skill level
-            m (int): Difficulty parameter
-            p_values (list, optional): Pre-computed p values
-            gamma_values (list, optional): Pre-computed gamma values
-            
-        Returns:
-            tuple: (accuracy, actual_inference_cost)
-        """
-        # Ensure p_values and gamma_values are available
-        if p_values is None or gamma_values is None:
-            p_values, gamma_values = self.train(C_tr)
-        
-        # Get consensus_count from policy_params
-        N_con = self.policy_params.get('consensus_count', 5)
-        
-        # Calculate R from C_tr
-        R = np.sqrt(C_tr / (6 * self.kappa * self.zeta**2))
-
-        # Compute steps per trial from C_inf
-        K_max_per_trial = C_inf / (N_con * 2 * self.zeta * R * self.omega)
-        
-        # Find best l_star for this allocation
-        best_accuracy = 0
-        cost = N_con * 2 * self.zeta * R * self.omega * K_max_per_trial
-        
-        # Find if any p_values is 1 and if so store index
-        p_is_1_index = np.where(np.array(p_values) == 1)[0]
-        l_min = 1 if len(p_is_1_index) == 0 else p_is_1_index[-1]
-
-        # Try different l_star values
-        for l_prime in range(l_min, self.L_max + 1):
-            p_l_prime = p_values[l_prime]
-            gamma_l_prime = gamma_values[l_prime]
-            
-            # Skip if gamma is 0
-            if gamma_l_prime == 0:
-                break
-                
-            gamma_l_prime = gamma_values[l_prime]
-            m_l_prime = self.compute_m_l_prime(l, l_prime, m)
-            M_l_prime = self.compute_M_l_prime(m_l_prime)
-            p_eff = p_l_prime * (self.rho / M_l_prime + 1-self.rho)
-            r_l_prime = p_eff * self.q(p_l_prime)
-            
-            # Base policy success probability
-            base_accuracy = self.compute_accuracy_COT(gamma_l_prime, m_l_prime, r_l_prime, K_max_per_trial)
-            
-            # Consensus accuracy calculation
-            maj_threshold = np.ceil((N_con + 1) / 2)
-            accuracy = betainc(maj_threshold, N_con-maj_threshold+1, base_accuracy)
-            
-            if accuracy > best_accuracy:
-                best_accuracy = accuracy
-                # Calculate expected steps per trial and total actual inference cost
-                expected_steps_per_trial = self.compute_expected_steps_cot(gamma_l_prime, m_l_prime, r_l_prime, K_max_per_trial)
-                cost = N_con * 2 * self.zeta * R * self.omega * expected_steps_per_trial
-        
         return best_accuracy, cost
     
     def evaluate_allocation_all(self, C_tr, C_inf):
@@ -1310,7 +1153,7 @@ class ModelFramework:
         
         # Plot each C_tr as a separate curve
         for C_tr, group in df.groupby("C_tr"):
-            ax.plot(group["Tokens"], group["Accuracy"], marker='o', label=f'{C_tr:.2e}')
+            ax.plot(group["Tokens"], group["Accuracy"], label=f'{C_tr:.2e}')
         
 
         # TESTING
@@ -1876,7 +1719,7 @@ class ConsensusModel(ModelFramework):
     Extension for Consensus Voting policy.
     """
     
-    def __init__(self, consensus_count=5, **kwargs):
+    def __init__(self, consensus_count, alphabet_size=2, **kwargs):
         """
         Initialize with custom parameters for Consensus Voting.
         
@@ -1892,7 +1735,51 @@ class ConsensusModel(ModelFramework):
         kwargs['policy_type'] = InferencePolicy.CONSENSUS
         kwargs['policy_params'] = kwargs.get('policy_params', {})
         kwargs['policy_params']['consensus_count'] = consensus_count
+        kwargs['policy_params']['alphabet_size'] = alphabet_size
         super().__init__(**kwargs)
+
+
+    def consensus_accuracy_multialphabet(self, N_con, p, A): # IN PROGRESS NOT CORRECT
+        """
+        Calculate consensus accuracy with alphabet size A
+        
+        Parameters:
+        N_con: Number of trials
+        p: Base accuracy (probability of correct answer)
+        A: Alphabet size (number of possible answers)
+        
+        Returns:
+        Probability of correct consensus
+        """
+        
+        # For alphabet size 2, use the efficient betainc calculation
+        if A == 2:
+            maj_threshold = np.ceil((N_con + 1) / 2)
+            return betainc(maj_threshold, N_con-maj_threshold+1, p)
+        
+        # For alphabet size > 2, calculate the full probability
+        total_prob = 0
+        
+        # Probability for each incorrect answer
+        p_incorrect = (1-p)/(A-1)
+        
+        # For each possible number of correct answers
+        for k in range(1, N_con + 1):  # k=0 won't win
+            # Probability of getting exactly k correct answers
+            p_k_correct = binom.pmf(k, N_con, p)
+            
+            # For alphabet size > 2, we need to calculate the probability 
+            # that the maximum count of any incorrect answer is < k
+            
+            # Probability any single incorrect answer appears fewer than k times
+            p_below_k = binom.cdf(k-1, N_con-k, p_incorrect/(1-p))
+            
+            # All A-1 incorrect answers must be below k
+            p_all_below = p_below_k ** (A-1)
+            
+            total_prob += p_k_correct * p_all_below
+        
+        return total_prob
     
     def evaluate_allocation_consensus(self, C_tr, C_inf, l, m, p_values=None, gamma_values=None):
         """
@@ -1914,7 +1801,8 @@ class ConsensusModel(ModelFramework):
             p_values, gamma_values = self.train(C_tr)
         
         # Get consensus_count from policy_params
-        N_con = self.policy_params.get('consensus_count', 5)
+        N_con = self.policy_params.get('consensus_count')
+        alphabet_size = self.policy_params.get('alphabet_size',2)
         
         # Calculate R from C_tr
         R = np.sqrt(C_tr / (6 * self.kappa * self.zeta**2))
@@ -1923,8 +1811,10 @@ class ConsensusModel(ModelFramework):
         K_max_per_trial = C_inf / (N_con * 2 * self.zeta * R * self.omega)
         
         # Find best l_star for this allocation
-        best_accuracy = 0
-        cost = K_max_per_trial * N_con
+        best_base_accuracy = 0
+        best_expected_steps = 0
+        accuracy=0
+        cost = N_con * 2 * self.zeta * R * self.omega * K_max_per_trial
         
         # Find if any p_values is 1 and if so store index
         p_is_1_index = np.where(np.array(p_values) == 1)[0]
@@ -1948,17 +1838,34 @@ class ConsensusModel(ModelFramework):
             # Base policy success probability
             base_accuracy = super().compute_accuracy_COT(gamma_l_prime, m_l_prime, r_l_prime, K_max_per_trial)
             
-            # Consensus accuracy calculation
-            maj_threshold = np.ceil((N_con + 1) / 2)
-            accuracy = betainc(maj_threshold, N_con-maj_threshold+1, base_accuracy)
-            
-            if accuracy > best_accuracy:
-                best_accuracy = accuracy
+            if base_accuracy > best_base_accuracy:
+                best_base_accuracy = base_accuracy
                 # Calculate expected steps per trial and total actual inference cost
                 expected_steps_per_trial = super().compute_expected_steps_cot(gamma_l_prime, m_l_prime, r_l_prime, K_max_per_trial)
-                cost = N_con * 2 * self.zeta * R * self.omega * expected_steps_per_trial
+                best_expected_steps = expected_steps_per_trial
+
+        # Consensus accuracy calculation
+        if best_base_accuracy > 0:
+            # Calculate accuracy using binomial distribution
+
+            # For consensus voting, we need to find the majority threshold
+            # maj_threshold is the minimum number of successes needed for majority
+            
+            maj_threshold = np.ceil((N_con+1) / alphabet_size)
+            accuracy = betainc(maj_threshold, N_con-maj_threshold+1, best_base_accuracy)
+            """
+            if alphabet_size == 2:
+                # Binary case - use efficient betainc function
+                maj_threshold = np.ceil((N_con + 1) / 2)
+                accuracy = betainc(maj_threshold, N_con-maj_threshold+1, best_base_accuracy)
+            else:
+                # Multi-alphabet case
+                accuracy = self.consensus_accuracy_multialphabet(N_con, best_base_accuracy, alphabet_size)
+            """
+
+            cost = N_con * 2 * self.zeta * R * self.omega * best_expected_steps
         
-        return best_accuracy, cost
+        return accuracy, cost
 
 class CustomDistributionModel(ModelFramework):
     """
@@ -2042,7 +1949,7 @@ class CustomEtaSigmaModel(ModelFramework):
             return super().sigma_l(l)
 
 
-def run_example(constants):
+def run_example(constants, base_C_inf_values, base_C_tr_values, con_count=64):
     """
     Example demonstrating how to use the framework with various model types.
     Tests each inference policy with appropriate budget scaling.
@@ -2066,8 +1973,6 @@ def run_example(constants):
     """
     
     # Define base ranges for grid evaluation
-    base_C_tr_values = [3.35e25]#np.logspace(24.5, 26.5, 20)  
-    base_C_inf_values = np.logspace(12, 15, 50)  
     
     # Initialize results dataframe
     all_results_df = pd.DataFrame()
@@ -2091,18 +1996,18 @@ def run_example(constants):
     
     # Add to combined results
     all_results_df = pd.concat([all_results_df, cot_df], ignore_index=True)
-    
+    """
     # Plot results
-    #try:
-        #plot_model_results(cot_model, cot_df, "cot")
-    #except Exception as e:
-    #    print(f"Error plotting for COT model: {e}")
+    try:
+        plot_model_results(cot_model, cot_df, "cot")
+    except Exception as e:
+        print(f"Error plotting for COT model: {e}")
 
     cot_model.plot_accuracy_vs_tokens(
         accuracy_df=cot_df,
         save_path=f"accuracy_vs_tokens_{cot_model}.png"
     )
-    """
+    
     # 2. TEST MCTS MODEL WITH 3X BUDGET
     print("Evaluating MCTS model with 3x inference budget...")
     branching_factor = 3
@@ -2132,7 +2037,7 @@ def run_example(constants):
     
     # 3. TEST BEST-OF-N MODEL WITH Nx BUDGET
     print("Evaluating Best-of-N model with scaled inference budget...")
-    n_samples = 5
+    n_samples = 16
     bon_model = BestOfNModel(n_samples=n_samples, constants=constants)
     
     # Scale inference budget by n_samples
@@ -2153,15 +2058,16 @@ def run_example(constants):
         plot_model_results(bon_model, bon_df, "best_of_n")
     except Exception as e:
         print(f"Error plotting for Best-of-N model: {e}")
-    
+    """
     # 4. TEST CONSENSUS MODEL WITH Nx BUDGET
     if hasattr(InferencePolicy, 'CONSENSUS'):
         print("Evaluating Consensus model with scaled inference budget...")
-        consensus_count = 5
-        consensus_model = ConsensusModel(consensus_count=consensus_count, constants=constants)
+        consensus_count = con_count
+        consensus_model = ConsensusModel(consensus_count=consensus_count, alphabet_size=100, constants=constants)
         
         # Scale inference budget by consensus_count
-        consensus_C_inf_values = base_C_inf_values * consensus_count
+        consensus_C_inf_values = np.array(base_C_inf_values) * consensus_count
+
         
         # Evaluate with scaled budget
         consensus_df = consensus_model.evaluate_grid_parallel(
@@ -2169,7 +2075,7 @@ def run_example(constants):
             output_file="accuracy_results_consensus.csv",
             replace=True
         )
-        
+    """
         # Add to combined results
         all_results_df = pd.concat([all_results_df, consensus_df], ignore_index=True)
         
