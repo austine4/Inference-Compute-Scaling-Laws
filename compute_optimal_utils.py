@@ -342,9 +342,6 @@ class ModelFramework:
             gamma_l = self.compute_gamma_l(p_l)
             gamma_values.append(gamma_l)
 
-
-        
-        
         return p_values, gamma_values
     
     def compute_m_l_prime(self, l, l_prime, m):
@@ -399,7 +396,7 @@ class ModelFramework:
             float: Training cost
         """
         return 6 * self.kappa * self.zeta**2 * R**2
-    
+
     # =========================================================================
     # POLICY-SPECIFIC FUNCTIONS
     # =========================================================================
@@ -1996,6 +1993,11 @@ def run_example(constants, base_C_inf_values, base_C_tr_values, con_count=64):
     
     # Add to combined results
     all_results_df = pd.concat([all_results_df, cot_df], ignore_index=True)
+    # Plot results
+    try:
+        plot_model_results(cot_model, cot_df, "cot")
+    except Exception as e:
+        print(f"Error plotting for COT model: {e}")
     """
     # Plot results
     try:
@@ -2058,7 +2060,7 @@ def run_example(constants, base_C_inf_values, base_C_tr_values, con_count=64):
         plot_model_results(bon_model, bon_df, "best_of_n")
     except Exception as e:
         print(f"Error plotting for Best-of-N model: {e}")
-    """
+    
     # 4. TEST CONSENSUS MODEL WITH Nx BUDGET
     if hasattr(InferencePolicy, 'CONSENSUS'):
         print("Evaluating Consensus model with scaled inference budget...")
@@ -2075,7 +2077,6 @@ def run_example(constants, base_C_inf_values, base_C_tr_values, con_count=64):
             output_file="accuracy_results_consensus.csv",
             replace=True
         )
-    """
         # Add to combined results
         all_results_df = pd.concat([all_results_df, consensus_df], ignore_index=True)
         
@@ -2129,7 +2130,7 @@ def plot_model_results(model, df, model_name):
     # Tokens vs. Training Cost
     fig5 = model.plot_tokens_contour(
         accuracy_df=df,
-        save_path=f"tokens_contour_{model_name}.png"
+        save_path=f"tokens_contour_{model_name}.png", xlim=(1e25, 1e26), ylim=(1e3, 1e5)
     )
     
     plt.close('all')  # Close all figures to free memory
