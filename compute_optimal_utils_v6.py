@@ -114,7 +114,14 @@ class ModelFramework:
         Returns:
             float: xi_l value
         """
-        return np.exp(-l/20)
+        # return np.exp(-l/20)
+        # return np.exp(-l/self.L)
+        return np.exp(-10*l/self.L)
+        # return np.exp(-l**2/80)
+        # return np.exp(-l**3/1e3)
+        # return np.exp(-l**3/2e3) # works for aime Claude
+        # return np.exp(-l**4/4e4)
+        # return np.exp(-np.exp(l/1e1))
     
     
     # Task distribution function over l,m
@@ -558,6 +565,7 @@ class ModelFramework:
             for k in range(l+1, l_prime+1):
                 prod *= self.sigma_l(k)
             result = max(np.ceil(m / prod), 2)
+            # result = max(np.round(m / prod), 2)
         elif l_prime == l:
             result = m
         else:  # l_prime < l
@@ -566,6 +574,7 @@ class ModelFramework:
             for k in range(l_prime+1, l+1):
                 prod *= self.sigma_l(k)
             result = np.ceil(m * prod)
+            # result = np.round(m * prod)
         
         return result
     
@@ -580,6 +589,7 @@ class ModelFramework:
             float: M_l' value
         """
         return np.ceil(m_l_prime + self.beta * m_l_prime)
+        # return np.round(m_l_prime + self.beta * m_l_prime)
     
     def compute_training_cost(self, R):
         """
@@ -646,6 +656,7 @@ class ModelFramework:
         # Initialize
         expected_steps = 0
         m = int(np.ceil(m_l_star))  # Ensure m is an integer
+        # m = int(np.round(m_l_star))  # Ensure m is an integer
         r = r_l_star
         gamma = gamma_l_star
         
@@ -807,6 +818,13 @@ class ModelFramework:
         
         # Compute p_values and gamma_values
         p_values, gamma_values = self.train(C_tr)
+        # plt.figure(100)
+        # plt.subplot(211)
+        # plt.plot(p_values)
+        # plt.subplot(212)
+        # plt.plot(gamma_values)
+        # plt.show(block=False)
+        # brkpnt1 = 1
 
         # Iterate over all possible values of l and m
         for l in range(self.L_min, self.L_max+1):
@@ -821,6 +839,11 @@ class ModelFramework:
                 expected_accuracy += prob * accuracy
                 expected_cost += prob * cost
         
+        # print Ctr expected accuracy in a single line
+        # print Ctr in xey format for example 1e1-, 2.5e15 etc
+
+        # print(f"Expected accuracy: {expected_accuracy:.4f}, Ctr: {C_tr:0.2e}")
+
         return expected_accuracy, expected_cost
 
     def evaluate_allocation_all_best_of_N(self, C_tr, C_inf):
@@ -1069,7 +1092,8 @@ class ModelFramework:
                     accuracy_df.to_csv(output_file, index=False)
         
         print(f"Completed: {processed} combinations processed, {skipped} combinations skipped.")
-        return accuracy_df
+        return accuracy_df    
+        
 
     def evaluate_grid_parallel(self, C_tr_values, C_inf_values, output_file=None, replace=False, n_jobs=-1):
         """Parallelized version of evaluate_grid"""
@@ -2186,18 +2210,18 @@ def run_example(constants, base_C_inf_values, base_C_tr_values, con_count=64):
     cot_model = ModelFramework(constants=constants, policy_type=InferencePolicy.COT)
     
     # Evaluate with baseline budget
-    cot_df = cot_model.evaluate_grid(
-       base_C_tr_values, base_C_inf_values, 
-       output_file="accuracy_results_cot.csv",
-       replace=True
-    )
-
-    # cot_df = cot_model.evaluate_grid_parallel(
-    #     base_C_tr_values, base_C_inf_values, 
-    #     output_file="accuracy_results_cot.csv",
-    #     replace=True,
-    #     n_jobs=4
+    # cot_df = cot_model.evaluate_grid(
+    #    base_C_tr_values, base_C_inf_values, 
+    #    output_file="accuracy_results_cot.csv",
+    #    replace=True
     # )
+
+    cot_df = cot_model.evaluate_grid_parallel(
+        base_C_tr_values, base_C_inf_values, 
+        output_file="accuracy_results_cot.csv",
+        replace=True,
+        n_jobs=4
+    )
     
     # Add to combined results
     all_results_df = pd.concat([all_results_df, cot_df], ignore_index=True)
@@ -2306,6 +2330,12 @@ def run_example(constants, base_C_inf_values, base_C_tr_values, con_count=64):
     #print("Evaluation complete. Results saved.")
     
     return all_results_df
+
+def plot_accuracy_vs_train_cost(constants, token_budget, base_C_tr_values):
+    cot_model = ModelFramework(constants=constants, policy_type=InferencePolicy.COT)
+
+
+
 
 def plot_model_results(model, df, model_name):
     """Helper function to generate all plots for a single model"""
