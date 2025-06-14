@@ -12,13 +12,31 @@ FONT_SIZE = 14
 plt.rcParams['mathtext.fontset'] = 'cm'
 plt.rcParams['font.family'] = 'STIXGeneral'
 plt.rcParams["font.size"] = str(FONT_SIZE)
-plt.rcParams['figure.figsize'] = 12, 10
+plt.rcParams['figure.figsize'] = 8, 6
 NUM_PTS = 100
 
 if __name__ == "__main__":
     # Set parameters
     dt = 6
     eps = 0.5
+
+    c = {
+    'L': 100,        # Maximum total skill level
+    'L_min': 60,    # Minimum task skill level
+    'L_max': 70,    # Maximum task skill level
+    'm_min': 2,     # Minimum number of skills
+    'm_max': 15,    # Maximum number of skills
+    'S_l': 1e4,   # Number of skills per level
+    'd_t': 6,       # Degrees of text pieces
+    'zeta': 2.5e3,  # Parameters per concept
+    'tau': 1e4,     # Tokens per training text piece
+    'omega': 25,    # Output tokens per skill
+    'kappa': 20,    # D_tr / N for chinchilla optimal
+    'beta': 5,     # Factor to scale skills required to relevant set
+    'rho': 0.5     # Search efficiency between relevant and required sets
+    }
+
+    colors = ['#1f77b4','#ff7f0e','#7f7f7f']    
     
     # Create a grid for R and T values
     min_R, max_R = 1e2, 1e12
@@ -42,23 +60,26 @@ if __name__ == "__main__":
     gcc_ratio_func = smp.lambdify([p, S], G_sol)
     
     # Parameters for pl calculation
-    L = 100
+    L = c['L']
     L_vec = np.arange(1, L+1, 1)
-    Sl = 1e3  # Size of skill space
+    Sl = c['S_l']  # Size of skill space
     Sl_vec = Sl * np.ones(L)
     
     # Create skill levels with different parameters
     eta_l = 5
-    sigma_l_vec = np.round(np.log2(L_vec))
-    xi_vec = np.exp(-L_vec/20)        
+    sigma_l_vec = 0.5*np.log(L_vec) #np.round(0.5*np.log(L_vec))
+    xi_vec = np.exp(-10*L_vec/L)  #      
     
     # generate a range of kappas
     kappa_vec = np.logspace(np.log10(10), np.log10(40), 100)
+    # kappa_vec = np.logspace(np.log10(15), np.log10(40), 100)
+    # kappa_vec = np.logspace(np.log10(18), np.log10(30), 100)
 
     # C_tr_vec = [1e18, 1e20, 1e22]
-    C_tr_vec = [1e20, 1e22, 1e24]
-    zeta_val = 1e4
-    tau_val = 4e4
+    # C_tr_vec = [1e20, 1e22, 1e24]
+    C_tr_vec = [1e22, 1e24, 1e26]
+    zeta_val = c['zeta']
+    tau_val = c['tau']
     # varsigma, tau = 2e5, 8e5
 
     fmwk = ModelFramework()
@@ -98,8 +119,8 @@ if __name__ == "__main__":
                     else:
                         term1_pl = (1/np.sqrt(2*d_delta))*np.exp(-d_delta*fmwk.D_KL(min(eta_l/d_delta, 1.0), Pbar))
                 
-                term2_pl = prereq_factor**(2*sigma_l_vec[ind_l])
-                pl = term1_pl * term2_pl
+                term2_pl = prereq_factor**(sigma_l_vec[ind_l])
+                pl = term1_pl # * term2_pl
                 
                 # Weight by skill distribution and add to sum
                 sum_pl += pl
@@ -112,12 +133,16 @@ if __name__ == "__main__":
             sum_pl_vec[ind2] = sum_pl
         
         # plot sum_pl_vec vs kappa
-        plt.plot(kappa_vec, sum_pl_vec, label=f'FLOPS = {C_tr_vec[ind]:.0e}')        
-            
-    plt.xscale('log')
+        plt.plot(kappa_vec, sum_pl_vec, color=colors[ind], linewidth=2, label=f'FLOPS = {C_tr_vec[ind]:.0e}')        
+
+    plt.ylabel(r'$\sum_{l=1}^{L}$ $p_s(l)$', fontsize=FONT_SIZE)
+    plt.xlabel(r'$\kappa$', fontsize=FONT_SIZE)        
+    plt.title("Trained Skill Competence by Token-to-Parameter Ratio", fontsize=FONT_SIZE)
+    plt.xscale('log')    
+    # plt.title(r'Sum of $p_l$ vs $\kappa$ for different FLOPS', fontsize=FONT_SIZE)
     plt.grid()
     plt.legend()
     # Save figure
-    plt.savefig('sum_pl_vs_kappa.png', dpi=300, bbox_inches='tight')
+    plt.savefig('sum_pl_vs_kappa_Jun3.png', dpi=100, bbox_inches='tight')
     plt.show(block=False)
     brkpnt1 = 1

@@ -102,7 +102,7 @@ class ModelFramework:
         Returns:
             float: sigma_l value
         """
-        return np.log2(l) if l > 1 else 0
+        return 0.5*np.log(l) if l > 1 else 0
 
     def xi_l(self, l):
         """
@@ -116,7 +116,16 @@ class ModelFramework:
         """
         # return np.exp(-l/20)
         # return np.exp(-l/self.L)
-        return np.exp(-10*l/self.L)
+        return np.exp(-10*l/self.L) # works - Good job Austin!
+        # return np.exp(-(7*l/self.L+7))
+        # return np.exp(-(3*l/self.L+5))
+        # return np.exp(-(1.5*l/self.L+5.3)) # incorrect slopt
+        # return np.exp(-(0.5*l/self.L+5.6)) # trial
+        # return np.exp(-6.0) # 6.0 to 6.1 is the boundary
+        # return np.exp(-(0.03*l/self.L+6))
+        # return np.exp(-7)*(2+np.exp(-(1e-2*l)))
+        # return np.exp(-7)*(1.654+np.exp(-(0.01*l/self.L)))
+        # return (l+10)**(-1.2)
         # return np.exp(-l**2/80)
         # return np.exp(-l**3/1e3)
         # return np.exp(-l**3/2e3) # works for aime Claude
@@ -209,6 +218,7 @@ class ModelFramework:
             float: Success probability
         """
         return p
+        # return 1
     
     # =========================================================================
     # CORE MATHEMATICAL FUNCTIONS
@@ -290,7 +300,7 @@ class ModelFramework:
             else:
                 term1_pl = (1/np.sqrt(2*d_delta))*np.exp(-d_delta*self.D_KL(eta/d_delta, P_bar))
         
-        term2_pl = gamma_prev**(2*sigma) #  factor of 2 - one for s_1 and another for s_2    
+        term2_pl = gamma_prev**(sigma) #  factor of 2 - one for s_1 and another for s_2    
         pl = term1_pl*term2_pl
 
         return pl
@@ -354,7 +364,7 @@ class ModelFramework:
             if p_l == 0:
                 gamma_l = 0.0
             else:
-                gamma_l = self.compute_gamma_l(p_l)
+                gamma_l = self.compute_gamma_l(p_l**2)
             gamma_values.append(gamma_l)
 
         return p_values, gamma_values
@@ -1205,10 +1215,13 @@ class ModelFramework:
         # Set log scale
         ax.set_xscale('log')
         
+        # capitalize policy_id for better readability
+        policy_id_capitalized = "CoT" if policy_id == "cot" else policy_id
+
         # Labels
         ax.set_xlabel("Inference Compute")
         ax.set_ylabel("Expected Accuracy")
-        ax.set_title(f"Expected Accuracy vs Inference Compute ({policy_id})")
+        ax.set_title(f"Expected Accuracy vs Inference Compute ({policy_id_capitalized})")
         
         # Get data range
         min_x = df["C_inf"].min()
@@ -1300,7 +1313,8 @@ class ModelFramework:
         # Labels
         ax.set_xlabel("Training Compute")
         ax.set_ylabel("Expected Accuracy")
-        ax.set_title(f"Expected Accuracy vs Training Compute ({policy_id})")
+        policy_id_capitalized = "CoT" if policy_id == "cot" else policy_id
+        ax.set_title(f"Expected Accuracy vs Training Compute ({policy_id_capitalized})")
         
         # Get data range
         min_x = df["C_tr"].min()
@@ -1388,7 +1402,8 @@ class ModelFramework:
         # Labels
         ax.set_xlabel("Inference Tokens")
         ax.set_ylabel("Expected Accuracy")
-        ax.set_title(f"Expected Accuracy vs Inference Tokens ({policy_id})")
+        policy_id_capitalized = "CoT" if policy_id == "cot" else policy_id
+        ax.set_title(f"Expected Accuracy vs Inference Tokens ({policy_id_capitalized})")
         
         # Get data range
         min_x = df["Tokens"].min()
@@ -1432,7 +1447,7 @@ class ModelFramework:
                      save_path=None, xlim=None, ylim=None):
         """
         Create a contour plot of accuracy as a function of training and inference costs.
-        Optionally overlay curves showing optimal allocation for different numbers of tasks.
+        Optionally overlay linear best fit lines showing optimal allocation for different numbers of tasks.
         
         Args:
             accuracy_df (pandas.DataFrame, optional): DataFrame with results
@@ -1449,10 +1464,6 @@ class ModelFramework:
         if accuracy_df is None:
             raise ValueError("No data provided. Please provide accuracy_df.")
         
-        # Convert inference_counts to numpy array to avoid issues with log10
-        if inference_counts is not None:
-            inference_counts = np.array(inference_counts, dtype=float)
-
         # Filter by policy
         policy_id = self.policy_type.value
         df = accuracy_df[accuracy_df['Policy'] == policy_id].copy()
@@ -1479,13 +1490,10 @@ class ModelFramework:
         log_tr_mesh, log_inf_mesh = np.meshgrid(log_tr_grid, log_inf_grid)
         
         # Points need to be in log space for better interpolation
-        log_points = np.column_stack((np.log10(list(C_tr_values)), np.log10(list(C_inf_values))))
+        log_points = np.column_stack((np.log10(C_tr_values), np.log10(C_inf_values)))
         
         # Interpolate accuracy values onto the log grid
         grid_accuracy = griddata(log_points, accuracy_values, (log_tr_mesh, log_inf_mesh), method='linear')
-        # Replace NaN values with zeros to avoid plotting issues
-        grid_accuracy = np.nan_to_num(grid_accuracy, nan=0.0)
-        grid_accuracy[grid_accuracy < 0] = 0.0
         
         # Convert mesh back to linear scale for plotting
         tr_mesh = 10**log_tr_mesh
@@ -1494,19 +1502,18 @@ class ModelFramework:
         # Create contour levels excluding values above 0.99
         min_acc = max(0, accuracy_values.min())
         max_acc = min(0.99, accuracy_values.max())  # Cap at 0.99
-        # max_acc = min(1.0, accuracy_values.max())  # Cap at 0.99
         levels = np.linspace(min_acc, max_acc, 10)
         
         # Define colormap for consistency
-        cmap = plt.cm.viridis
+        cmap = plt.cm.inferno
         
         # Create colored contour lines with increased transparency
         contour_lines = ax.contour(tr_mesh, inf_mesh, grid_accuracy, levels=levels, 
-                                  cmap=cmap, linewidths=1.0, alpha=0.7)  # More transparent
+                                  cmap=cmap, linewidths=1.0, alpha=0.7)
         
         # Add scatter points with increased transparency
         scatter = ax.scatter(C_tr_values, C_inf_values, c=accuracy_values, cmap=cmap,
-                            edgecolor='k', s=15, alpha=0.7, zorder=5)  # Smaller and more transparent
+                            edgecolor='k', s=15, alpha=0.7, zorder=5)
         
         # Add colorbar
         cbar = plt.colorbar(scatter)
@@ -1517,12 +1524,12 @@ class ModelFramework:
         # Create an interpolator for accuracy as a function of C_tr and C_inf
         accuracy_interp = LinearNDInterpolator(log_points, accuracy_values)
         
+        # Store all optimal curves for legend checking
+        all_optimal_curves = []
+        
         # Define the range of inference counts if provided
-        if len(inference_counts)>0:
-            # Create a red colormap with progressively darker shades
-            # Use a reversed "Reds" colormap so larger values of I get darker shades
-            red_cmap = cm.get_cmap('Reds')
-            optimal_curve_colors = red_cmap(np.linspace(0.5, 1, len(inference_counts)))
+        if inference_counts:
+            optimal_curve_colors = ['#A7EFFF', '#2FB8C6', '#015D67']
             
             # For each inference count, find the optimal compute allocation
             for i, I in enumerate(inference_counts):
@@ -1563,17 +1570,66 @@ class ModelFramework:
                             best_acc = acc
                             best_tr = C_tr_test
                             best_inf = C_inf_test
+                    
+                    # Only add if accuracy is below 0.99 and we found a valid solution
+                    if best_acc > 0 and best_acc < 0.99:
+                        optimal_tr.append(best_tr)
+                        optimal_inf.append(best_inf)
+                        optimal_acc.append(best_acc)
                 
-                # Only add if accuracy is below 0.99 and we found a valid solution
-                if best_acc > 0 and best_acc <= 1.0:
-                    optimal_tr.append(best_tr)
-                    optimal_inf.append(best_inf)
-                    optimal_acc.append(best_acc)
+                # Store the curve data
+                all_optimal_curves.append((optimal_tr, optimal_inf, optimal_acc))
                 
-                # Plot the optimal curve with thicker lines to stand out
-                if optimal_tr:  # Only if we have valid points
-                    ax.plot(optimal_tr, optimal_inf, '-', color=optimal_curve_colors[i], 
-                            linewidth=2.5, label=f'{I:.0e}', zorder=10)
+                # Plot the optimal curve
+                if optimal_tr and len(optimal_tr) > 2:  # Need at least 3 points for fitting
+                    optimal_tr = np.array(optimal_tr)
+                    optimal_inf = np.array(optimal_inf)
+                    
+                    # Sort by training compute for proper fitting
+                    sort_indices = np.argsort(optimal_tr)
+                    optimal_tr_sorted = optimal_tr[sort_indices]
+                    optimal_inf_sorted = optimal_inf[sort_indices]
+                    
+                    # Fit linear line in log space: log(C_inf) = m * log(C_tr) + b
+                    log_tr = np.log10(optimal_tr_sorted)
+                    log_inf = np.log10(optimal_inf_sorted)
+                    
+                    # Linear regression in log space
+                    coeffs = np.polyfit(log_tr, log_inf, 1)  # Linear fit: [slope, intercept]
+                    slope, intercept = coeffs[0], coeffs[1]
+                    
+                    # Calculate R-squared for goodness of fit
+                    log_inf_pred = np.polyval(coeffs, log_tr)
+                    ss_res = np.sum((log_inf - log_inf_pred) ** 2)
+                    ss_tot = np.sum((log_inf - np.mean(log_inf)) ** 2)
+                    r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+                    
+                    # Create line for plotting (extend slightly beyond data range)
+                    log_tr_line = np.linspace(log_tr.min() - 0.1, log_tr.max() + 0.1, 100)
+                    log_inf_line = np.polyval(coeffs, log_tr_line)
+                    tr_line = 10**log_tr_line
+                    inf_line = 10**log_inf_line
+                    
+                    # Plot the best fit line
+                    ax.plot(tr_line, inf_line, '--', color=optimal_curve_colors[i], 
+                           linewidth=2.0, alpha=0.8, zorder=10)
+                    
+                    # Plot the original points
+                    ax.scatter(optimal_tr_sorted, optimal_inf_sorted, 
+                             color=optimal_curve_colors[i], s=25, alpha=0.8, zorder=11)
+                    
+                    # Create legend entry with equation
+                    # Format: "1e5: C_inf = a * C_tr^b (R²=0.xx)"
+                    a = 10**intercept
+                    b = slope
+                    if r_squared > 0.01:
+                        legend_label = f'{I:.0e}: C_inf = {a:.2e} × C_tr^{b:.2f} (R²={r_squared:.2f})'
+                    else:
+                        legend_label = f'{I:.0e}: C_inf = {a:.2e} × C_tr^{b:.2f}'
+                    
+                    # Store for legend (we'll update this)
+                    ax.plot([], [], color=optimal_curve_colors[i], linewidth=2.0, 
+                           label=legend_label)
         
         # Set log scales
         ax.set_xscale('log')
@@ -1583,13 +1639,11 @@ class ModelFramework:
         if xlim:
             ax.set_xlim(*xlim)
         else:
-            # Default limits with some margin
             ax.set_xlim(10**log_tr_min * 0.5, 10**log_tr_max * 2)
             
         if ylim:
             ax.set_ylim(*ylim)
         else:
-            # Default limits with some margin
             ax.set_ylim(10**log_inf_min * 0.5, 10**log_inf_max * 2)
         
         # Set axis labels and title
@@ -1598,10 +1652,10 @@ class ModelFramework:
         ax.set_title(f'Optimal Compute Allocation for Different Numbers of Tasks ({policy_id})')
         
         # Add legend for inference counts if we plotted them
-        if len(inference_counts)>0 and any(optimal_tr for optimal_tr in optimal_tr):
-            ax.legend(title='Number of Tasks', loc='best')
+        # if inference_counts and any(len(curve[0]) > 0 for curve in all_optimal_curves):
+        ax.legend(loc='best')
         
-        # Manually draw grid lines with increased transparency
+        # Grid lines (same as original)
         ax.grid(False)
         
         # X-axis major grid lines
@@ -1632,12 +1686,12 @@ class ModelFramework:
         
         plt.tight_layout()
         
-        if save_path is not None:
+        if save_path:
             plt.savefig(save_path, dpi=300)
         
         return fig
     
-    def plot_tokens_contour(self, accuracy_df=None, inference_counts=None, figsize=(12, 10), 
+    def plot_tokens_contour(self, accuracy_df=None, inference_counts=None, figsize=(10, 8), 
                       save_path=None, xlim=None, ylim=None):
         """
         Create a contour plot of accuracy as a function of training cost and inference tokens.
@@ -1695,14 +1749,15 @@ class ModelFramework:
         # Create contour levels excluding values above 0.99
         min_acc = max(0, np.nanmin(accuracy_values))
         max_acc = min(0.99, np.nanmax(accuracy_values))  # Cap at 0.99
-        levels = np.linspace(min_acc, max_acc, 10)
+        levels = np.linspace(min_acc, max_acc, 14)
         
         # Define colormap for consistency
-        cmap = plt.cm.viridis
+        # cmap = plt.cm.viridis
+        cmap = plt.cm.inferno # change to inferno
         
         # Create colored contour lines with increased transparency
         contour_lines = ax.contour(tr_mesh, tokens_mesh, grid_accuracy, levels=levels, 
-                                cmap=cmap, linewidths=1.0, alpha=0.7)
+                                cmap=cmap, linewidths=2.0, alpha=0.7)
         
         # Add scatter points with increased transparency
         scatter = ax.scatter(C_tr_values, tokens_values, c=accuracy_values, cmap=cmap,
@@ -1734,7 +1789,8 @@ class ModelFramework:
         # Set axis labels and title
         ax.set_xlabel('Training Compute')
         ax.set_ylabel('Inference Tokens per Task')
-        ax.set_title(f'Accuracy as a Function of Training Compute and Inference Tokens ({policy_id})')
+        policy_id_capitalized = "CoT" if policy_id == "cot" else policy_id
+        ax.set_title(f'Accuracy as a Function of Training Compute and Inference Tokens ({policy_id_capitalized})')
         
         # Manually draw grid lines with increased transparency
         ax.grid(False)
@@ -2370,7 +2426,7 @@ def plot_model_results(model, df, model_name):
     # Tokens vs. Training Cost
     fig5 = model.plot_tokens_contour(
         accuracy_df=df,
-        save_path=f"tokens_contour_{model_name}.png", xlim=(1e25, 1e26), ylim=(1e3, 1e5)
+        save_path=f"tokens_contour_{model_name}.png", xlim=(1e24, 1e27), ylim=(1e0, 1e8)
     )
     
     plt.close('all')  # Close all figures to free memory
